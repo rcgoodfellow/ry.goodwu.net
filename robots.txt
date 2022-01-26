@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://ry.goodwu.net/sitemap.xml
