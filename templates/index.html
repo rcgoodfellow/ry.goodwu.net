@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="title">
+    <h1 class="title"> Packet Plumbing </h1>
+</div>
+<div class="subtitle">
+    <span> Thoughts on plumbing frames, packets and segments. </span>
+</div>
+<section>
+    <p>
+        My name is Ryan Goodfellow. I'm an engineer at the 
+        <a href="https://oxide.computer">Oxide Computer Company</a>. 
+        My work focuses on networking at the hardware/software interface on the 
+        <a href="https://illumos.org">illumos</a>
+        operating system. Specific areas of interest include routing protocols, 
+        operating system network architecture, network testbeds and emulation.
+    </p>
+</section>
+
+<section>
+    <h2> Tinkering </h2>
+    <p>
+    Tinkering is the process of learning by experimentation. Poking at things
+    to see how they respond. Collecting observations to build higher level
+    understanding and peeling back layers of complexity to build deeper
+    understanding. When combined with open-source systems, tinkering becomes
+    an even more powerful tool for building knowledge. This series of posts
+    explores networking systems through tinkering and source code.
+    </p>
+    {% set section =  get_section(path="tinkering/_index.md") %}
+    {% for page in section.pages %}
+    <div class="lsitem">
+        <span class="date {% if page.draft %}draft{% endif %}">{{ page.date }}</span>
+        {% if page.draft %}<span class="draft draftmarker">Draft</span>{% endif %}
+        <a href="{{ page.permalink | safe }}">{{ page.title }}</a>
+    </div>
+    {% endfor %}
+</section>
+
+<section>
+    <h2> Architecture </h2>
+    <p>
+    Architecture is what allows complex systems to evolve and maintain stability
+    at the same time. At Oxide, we're working on building open systems beyond
+    the traditional network black-box function boundaries. These efforts are
+    revealing a fully programmable data plane which, presents new complexities
+    that must be approached at the operating system network architecture level
+    to be successful. This series of posts explores the opportunities in this
+    space.
+    </p>
+    {% set section =  get_section(path="architecture/_index.md") %}
+    {% for page in section.pages %}
+    <div class="lsitem">
+        <span class="date {% if page.draft %}draft{% endif %}">{{ page.date }}</span>
+        {% if page.draft %}<span class="draft draftmarker">Draft</span>{% endif %}
+        <a href="{{ page.permalink | safe }}">{{ page.title }}</a>
+    </div>
+    {% endfor %}
+</section>
+
+<!-- 
+<section>
+    <h2> Software </h2>
+    <ul>
+        <li> Maghemite </l1>
+        <li> DDM </l1>
+        <li> Falcon </l1>
+        <li> p4.rs </l1>
+    </ul>
+</section>
+-->
+
+{% endblock content %}

@@ -1,0 +1,198 @@
+$font-stack: "system-ui", sans-serif;
+
+$primary-color: #222;
+$background-color: #FFF;
+$link-color: #7F6DF2;
+//$subtitle-color: #2116c7;
+$subtitle-color: #109f94;
+$code-background: #F5F6F8;
+$title-color: #008fd4;
+$date: #777;
+
+$dark-primary-color: #ddd;
+$dark-reading-color: #c0c0c0;
+$dark-background-color: #202020;
+$dark-code-background: #191919;
+$dark-link-color: #7F6DF2;
+$dark-subtitle-color: #36D4C7;
+$dark-title-color: #5EB0D7;
+$dark-code-color: #C7254E;
+$dark-date: #777;
+
+html {
+    font: 16px $font-stack;
+}
+pre {
+    font: 14px "ui-monospace", menlo, monospace;
+    padding: 10px;
+    line-height: 1.3em;
+    overflow-x: scroll;
+}
+code {
+    font: 14px "ui-monospace", menlo, monospace;
+    line-height: 1.3em;
+    font-weight: bold;
+}
+pre code {
+    font-weight: normal;
+}
+section {
+    //font-weight: 200;
+}
+body {
+    max-width: 900px;
+    margin: 0 auto;
+}
+p {
+    line-height: 1.5em;
+}
+h1 {
+    font-size: 2em;
+    font-weight: 300;
+    display: inline-block;
+}
+h2 {
+    font-weight: 300;
+}
+
+.sectiontitle {
+    text-transform: capitalize;
+}
+
+sup { vertical-align: top; font-size: 0.6em; }
+
+.footnote-definition {
+    margin: 0.5em;
+}
+.footnote-definition p {
+    display: inline;
+}
+.date {
+    margin-right: 0.5em;
+}
+
+.draftmarker{
+    margin-right: 0.5em;
+}
+
+.subtitle {
+}
+
+.lsitem,.blogsub {
+    font: 16px "ui-monospace", menlo, monospace;
+}
+
+.lsitem {
+    margin-top: 10px;
+}
+
+@media screen and (min-width: 600px) {
+    html {
+        margin: 1em;
+    }
+    li {
+        margin-top: 0.25em;
+    }
+    h1 {
+    }
+}
+
+@media screen and (max-width: 600px) {
+    html {
+        margin: 0.5em;
+    }
+    li {
+        margin-top: 0.5em;
+    }
+    h1 {
+        text-align: center;
+        margin-left: auto;
+        margin-right: auto;
+    }
+    .title {
+        text-align: center;
+    }
+    .subtitle {
+        text-align: center;
+    }
+}
+
+@media (prefers-color-scheme: light) {
+    body {
+        color: $primary-color;
+        background-color: $background-color;
+    }
+    pre {
+        background: $code-background !important;
+    }
+    a, a code {
+        color: $link-color;
+    }
+    .subtitle {
+        color: $subtitle-color;
+    }
+    h1 {
+        color: $title-color;
+    }
+    h2 {
+        color: $title-color;
+    }
+    h3 {
+        color: $title-color;
+    }
+    .date {
+        color: $date;
+    }
+    .path {
+        color: $subtitle-color;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    body {
+        color: $dark-primary-color;
+        background-color: $dark-background-color;
+    }
+    code {
+        color: $dark-primary-color;
+    }
+    pre code {
+        color: $dark-reading-color;
+    }
+    pre {
+        background: $dark-code-background !important;
+    }
+    section {
+        color: $dark-reading-color;
+    }
+    a, a code {
+        color: $link-color !important;
+    }
+    h1 {
+        color: $dark-title-color;
+    }
+    h2 {
+        color: $dark-title-color;
+    }
+    h3 {
+        color: $dark-title-color;
+    }
+    .subtitle {
+        color: $dark-subtitle-color;
+    }
+    .date {
+        color: $dark-date;
+    }
+    .path {
+        color: $dark-subtitle-color;
+    }
+    strong {
+        color: $dark-primary-color;
+    }
+    .draft {
+        color: #c33 !important;
+    }
+}
+
+@import url("syntax-theme-dark.css") (prefers-color-scheme: dark);
+@import url("syntax-theme-light.css") (prefers-color-scheme: light);

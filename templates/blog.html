@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="title">
+    <h1 class="title">
+        Packet Plumbing
+    </h1>
+    <div class="subtitle sectiontitle blogsub">
+        <a class="path" href="/">~</a> /
+        <a class="path" href="/{{ section.title }}">{{ section.title }}</a> /
+    </div>
+</div>
+    {% for page in section.pages %}
+    <div class="lsitem">
+        <span class="date {% if page.draft %}draft{% endif %}">{{ page.date }}</span>
+        {% if page.draft %}<span class="draft draftmarker">Draft</span>{% endif %}
+        <a href="{{ page.permalink | safe }}">{{ page.title }}</a>
+    </div>
+    {% endfor %}
+{% endblock content %}

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+
+{% block content %}
+{% set section =  get_section(path=page.ancestors[1]) %}
+<div class="title">
+    <h1 class="title">
+        {{ page.title }}
+    </h1>
+</div>
+<div class="subtitle blogsub sectiontitle">
+    <span class="date {% if page.draft %}draft{% endif %}">{{ page.date }}</span>
+    {% if page.draft %}<span class="draft draftmarker">Draft</span>{% endif %}
+    <a class="path" href="/">~</a> /
+    <a class="path" href="/{{ section.title }}">{{ section.title }}</a> /
+</div>
+{{ page.content | safe }}
+{% endblock content %}
