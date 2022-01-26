@@ -24,7 +24,7 @@ jobs:
       - name: prep deployment branch
         run: |
           mkdir -p dist
-          cp -r public dist/
+          cp -r public/* dist/
           cd dist
           git init
           git add -A
