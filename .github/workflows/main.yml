@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: install zola
-        run: snap install --edge zola
+        run: sudo snap install --edge zola
 
       - name: build the site
         run: zola build --drafts
