@@ -25,6 +25,7 @@ jobs:
         run: |
           mkdir -p dist
           cp -r public/* dist/
+          echo "ry.goodwu.net" > dist/CNAME
           cd dist
           git init
           git add -A
