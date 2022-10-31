@@ -323,7 +323,7 @@ pointers
 The function we are currently looking at is
 [`so_sendmsg`](https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon_sops.c#342).
 
-The first interesting thing that happens here is we are determining of the send
+The first interesting thing that happens here is we are determining if the send
 function of this `sonode` is flow controlled via `SO_SND_FLOWCTRLD` and then
 waiting until the send queue for the `sonode` is not full so we can send data
 through it. Let's use `dtrace` to see if this is happening with ping program.
