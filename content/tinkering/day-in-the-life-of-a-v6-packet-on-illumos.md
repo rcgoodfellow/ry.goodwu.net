@@ -402,7 +402,7 @@ For IPv6, `ip_attr_connect` is mostly a wrapper around
 In keeping with our present theme of unexpected names, this function does not
 set an IPv6 destination. What this function actually does is:
 
-- Get an routing table entry for the destination address, bailing with an error
+- Get a routing table entry for the destination address, bailing with an error
   if no route is found, or if the route is something like a black hole entry.
 - Set the _source_ address for the outgoing packet under certain conditions.
 - Creates a destination cache entry (DCE) for the destination address of the
@@ -502,7 +502,7 @@ nce_addr = ::ffff:127.0.0.1
 
 Great, now let's run that `dtrace` above again.
 
-Something interesting to note in the `icmp_output_newdist` function is in the
+Something interesting to note in the `icmp_output_newdst` function is in the
 call to
 [`icmp_prepend_header_template`](https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#3986).
 Notice in our application code we are not calculating and setting the ICMP
