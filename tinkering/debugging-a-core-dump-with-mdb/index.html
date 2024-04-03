@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>Packet Plumbing</title>
+    <link rel="stylesheet" href="/index.css"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+
+<body>
+    <section class="section">
+        <div class="container">
+            
+
+<div class="title">
+    <h1 class="title">
+        Debugging a Core Dump with MDB
+    </h1>
+</div>
+<div class="subtitle blogsub sectiontitle">
+    <span class="date ">2022-08-29</span>
+    
+    <a class="path" href="/">~</a> /
+    <a class="path" href="/tinkering">tinkering</a> /
+</div>
+<p>Our story begins
+<a href="https://github.com/oxidecomputer/propolis/blob/9952e9701d5d89faa8fe9371a6dc273da9fff6e6/propolis/src/hw/virtio/softnpu.rs#L802-L807">here</a>.</p>
+<pre data-lang="rust" class="language-rust z-code"><code class="language-rust" data-lang="rust"><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">queue_notify</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span><span class="z-keyword z-operator z-rust">&amp;</span><span class="z-variable z-parameter z-rust">self</span>, <span class="z-variable z-parameter z-rust">vq</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span><span class="z-meta z-generic z-rust">Arc<span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span>VirtQueue<span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span>, <span class="z-variable z-parameter z-rust">ctx</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span>DispCtx</span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> handle <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-meta z-path z-rust">tokio<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">runtime<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">Handle<span class="z-punctuation z-accessor z-rust">::</span></span>current<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> _guard <span class="z-keyword z-operator z-assignment z-rust">=</span> handle<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">enter</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-meta z-path z-rust">futures<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">executor<span class="z-punctuation z-accessor z-rust">::</span></span>block_on<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-variable z-language z-rust">self</span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">handle_guest_virtio_request</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>vq<span class="z-punctuation z-separator z-rust">,</span> ctx</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span></code></pre>
+<p>We've landed in a callback we do not control. This callback is not <code>async</code> and
+we need to call some <code>async</code> code. We know that the process we're running in has
+a tokio runtime. So we get a handle to that runtime, enter it and attempt to
+block on a future.</p>
+<p>When we reach this code, the process we are running in crashes and dumps its
+core. There are a number of things to be learned from the core file. The
+following analysis is done with the illumos <code>mdb</code> tool. A good guide on <code>mdb</code>
+can be found <a href="https://illumos.org/books/dev/debugging.html#core-dumps">here</a></p>
+<p>The first thing the core file tells us is that we are in fact experiencing a
+segfault.</p>
+<pre class="z-code"><code><span class="z-text z-plain">&gt; ::status
+</span><span class="z-text z-plain">debugging core file of propolis-server (64-bit) from masaka
+</span><span class="z-text z-plain">file: /home/ry/src/propolis/target/release/propolis-server
+</span><span class="z-text z-plain">initial argv: /home/ry/src/propolis/target/release/propolis-server run .falcon/router.toml [:
+</span><span class="z-text z-plain">threading model: native threads
+</span><span class="z-text z-plain">status: process terminated by SIGSEGV (Segmentation Fault), addr=fffffbffc44dced0
+</span></code></pre>
+<p>A stack trace shows us that <code>the Future::poll</code> method is the point of explosion,
+which is a few calls down the chain from our <code>queue_notify</code> call.</p>
+<pre class="z-code"><code><span class="z-text z-plain">&gt; $G
+</span><span class="z-text z-plain">&gt; &gt; $C
+</span><span class="z-text z-plain">fffffbffc67fe870 &lt;core::future::from_generator::GenFuture&lt;T&gt; as core::future::future::Future&gt;::poll::h0a10623d62628f3a+0x19a()
+</span><span class="z-text z-plain">fffffbffc67fe8b0 std::thread::local::LocalKey&lt;T&gt;::with::he924ca0bd4e6d9cf+0x56()
+</span><span class="z-text z-plain">fffffbffc67fefd0 futures_executor::local_pool::block_on::h7b551178601388b4+0x4c()
+</span><span class="z-text z-plain">fffffbffc67ff700 &lt;propolis::hw::virtio::softnpu::PciVirtioSoftNPUPort as propolis::hw::virtio::VirtioDevice&gt;::queue_notify::h2900034107523958+0x66()
+</span><span class="z-text z-plain">fffffbffc67ff780 propolis::hw::virtio::pci::PciVirtioState::legacy_write::h683ad0199a8250fb+0x274()
+</span><span class="z-text z-plain">fffffbffc67ff900 propolis::hw::virtio::pci::&lt;impl propolis::hw::pci::device::Device for D&gt;::bar_rw::{{closure}}::hea30c7837f72dad6+0x1aa()
+</span><span class="z-text z-plain">fffffbffc67ffa80 propolis::util::regmap::RegMap&lt;ID&gt;::process::h3d39f905a5a91b8b+0x171()
+</span><span class="z-text z-plain">fffffbffc67ffb50 propolis::hw::pci::device::&lt;impl propolis::hw::pci::Endpoint for D&gt;::bar_rw::h883683c8494c42ce+0x134()
+</span><span class="z-text z-plain">fffffbffc67ffc50 propolis::pio::PioBus::handle_out::h0f978df375855073+0x2aa()
+</span><span class="z-text z-plain">fffffbffc67ffe20 propolis::vcpu_run_loop::h5a6c9e2b54e47a88+0x286()
+</span><span class="z-text z-plain">fffffbffc67ffe50 core::ops::function::FnOnce::call_once{{vtable.shim}}::h96a1f70aa2cd73b4+0x1e()
+</span><span class="z-text z-plain">fffffbffc67ffee0 std::sys_common::backtrace::__rust_begin_short_backtrace::h0c5e358dfc29343a +0x90()
+</span><span class="z-text z-plain">fffffbffc67fff60 core::ops::function::FnOnce::call_once{{vtable.shim}}::hffcdb87c11bdff96+0x95()
+</span><span class="z-text z-plain">fffffbffc67fffb0 std::sys::unix::thread::Thread::new::thread_start::h5ec8d723f4048251+0x27()
+</span><span class="z-text z-plain">fffffbffc67fffe0 libc.so.1`_thrp_setup+0x6c(fffffbffee0e1a40)
+</span><span class="z-text z-plain">fffffbffc67ffff0 libc.so.1`_lwp_start()
+</span></code></pre>
+<p><strong>pro-tip:</strong> the <code>$G</code> here turns on demangling support in <code>mdb</code> without which
+your eyes will bleed over the rust compilers mangling of method names.</p>
+<p>Let's take a closer look at the point of explosion. In the below output <code>Future</code>
+is substituted for <code>&lt;core::future::from_generator::GenFuture&lt;T&gt; as core::future::future::Future&gt;</code> to make the output a bit more readable.</p>
+<p>Below we're asking <code>mdb</code> to disassemble instructions around the instruction
+pointer at the time of the crash.  <code>mdb</code> highlights the function that
+segfaulted, which does not go well with markdown code blocks, so I've identified
+the crashing line here with a sequence of exclamation points.</p>
+<pre class="z-code"><code><span class="z-text z-plain">&gt; &lt;rip::dis -n 0xe
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x151:    movq   0xc0(%r14),%rdi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x158:    call   *0x18(%rax)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x15b:    movq   0x28(%r15),%rsi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x15f:    testq  %rsi,%rsi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x162:    je     +0x34e   &lt;Future::poll::h0a10623d62628f3a+0x4b6&gt;
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x168:    movq   0x18(%r14),%rbx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x16c:    movl   (%rbx),%edx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x16e:    movq   0x98(%r14),%rax
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x175:    movq   %rax,-0xa0(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x17c:    movups 0x88(%r14),%xmm0
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x184:    movaps %xmm0,-0xb0(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x18b:    movq   0x30(%r15),%rax
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x18f:    leaq   -0x58(%rbp),%rdi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x193:    leaq   -0xb0(%rbp),%rcx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x19a:    call   *0x18(%rax) !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x19d:    cmpq   $0x0,-0x58(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1a2:    je     +0x46    &lt;Future::poll::h0a10623d62628f3a+0x1ea&gt;
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1a4:    leaq   0x8(%rbx),%rcx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1a8:    addq   $0x30,%rbx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1ac:    movq   -0x38(%rbp),%rax
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1b0:    movq   %rax,-0x60(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1b4:    movups -0x58(%rbp),%xmm0
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1b8:    movups -0x48(%rbp),%xmm1
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1bc:    movaps %xmm1,-0x70(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1c0:    movaps %xmm0,-0x80(%rbp)
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1c4:    movl   -0x30(%rbp),%edx
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1c7:    leaq   -0x80(%rbp),%rdi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1cb:    movq   %rbx,%rsi
+</span><span class="z-text z-plain">Future::poll::h0a10623d62628f3a+0x1ce:    call   +0x233ed &lt;propolis::hw::virtio::softnpu::PciVirtioSoftNPUPort::handle_packet_to_ext_port::h4103b5a93ebf77ce&gt;
+</span></code></pre>
+<p>Here we see the crashing instruction is <code>call *0x18(%rax)</code>.  We can see what the
+value of <code>rax</code> is by dumping the registers at the time of the crash.</p>
+<pre class="z-code"><code><span class="z-text z-plain">&gt; $r
+</span><span class="z-text z-plain">%rax = 0xfffffbffc44dceb8       %r8  = 0x0000000000000000
+</span><span class="z-text z-plain">%rbx = 0x0000000002c2c3f0       %r9  = 0x0000000016ba6f00
+</span><span class="z-text z-plain">%rcx = 0xfffffbffc67fe7c0       %r10 = 0x0000000000000501
+</span><span class="z-text z-plain">%rdx = 0x0000000000000000       %r11 = 0x0000000000000000
+</span><span class="z-text z-plain">%rsi = 0x0000000002f5b550       %r12 = 0x0000000000000063
+</span><span class="z-text z-plain">%rdi = 0xfffffbffc67fe818       %r13 = 0xfffffbffc67fe818
+</span><span class="z-text z-plain">                                %r14 = 0xfffffbffc67fe8c8
+</span><span class="z-text z-plain">                                %r15 = 0x0000000002c8f5c0
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">%cs = 0x0053    %fs = 0x0000    %gs = 0x0000
+</span><span class="z-text z-plain">%ds = 0x004b    %es = 0x004b    %ss = 0x004b
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">%rip = 0x000000000139a03a &lt;core::future::from_generator::GenFuture&lt;T&gt; as core::future::future::Future&gt;::poll::h0a10623d62628f3a+0x19a
+</span><span class="z-text z-plain">%rbp = 0xfffffbffc67fe870
+</span><span class="z-text z-plain">%rsp = 0xfffffbffc67fe7a0
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">%rflags = 0x00010206
+</span><span class="z-text z-plain">  id=0 vip=0 vif=0 ac=0 vm=0 rf=1 nt=0 iopl=0x0
+</span><span class="z-text z-plain">  status=&lt;of,df,IF,tf,sf,zf,af,PF,cf&gt;
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">%gsbase = 0x0000000000000000
+</span><span class="z-text z-plain">%fsbase = 0xfffffbffee0e1a40
+</span><span class="z-text z-plain">%trapno = 0xe
+</span><span class="z-text z-plain">   %err = 0x4
+</span></code></pre>
+<p>So here we see the value of <code>rax</code> is <code>0xfffffbffc44dceb8</code> and if we add an
+offset of <code>0x18</code> to that which is what the call above is doing, we land at an
+address of <code>fffffbffc44dced0</code> which is what our <code>::status</code> dcmd above reported
+as the segfault address.</p>
+<p>In the disassembly above we can see a call to <code>handle_packet_to_ext_port</code>. The
+corresponding rust code looks like
+<a href="https://github.com/oxidecomputer/propolis/blob/9952e9701d5d89faa8fe9371a6dc273da9fff6e6/propolis/src/hw/virtio/softnpu.rs#L602-L620">this</a>.</p>
+<pre data-lang="rust" class="language-rust z-code"><code class="language-rust" data-lang="rust"><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">handle_guest_packet</span></span><span class="z-meta z-generic z-rust"><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-storage z-modifier z-lifetime z-rust">&#39;a</span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">index</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-storage z-type z-rust">usize</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-storage z-modifier z-rust">mut</span> <span class="z-variable z-parameter z-rust">pkt</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-meta z-generic z-rust">packet_in<span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-storage z-modifier z-lifetime z-rust">&#39;a</span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">data_handles</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span><span class="z-meta z-generic z-rust"><span class="z-support z-type z-rust">Vec</span><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-meta z-path z-rust">dlpi<span class="z-punctuation z-accessor z-rust">::</span></span>DlpiHandle<span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">pipeline</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span><span class="z-storage z-modifier z-rust">mut</span> <span class="z-meta z-generic z-rust"><span class="z-support z-type z-rust">Box</span><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span>dyn Pipeline<span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">log</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span>Logger,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-keyword z-control z-rust">match</span> pipeline<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">process_packet</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>index <span class="z-keyword z-operator z-rust">as</span> <span class="z-storage z-type z-rust">u8</span><span class="z-punctuation z-separator z-rust">,</span> <span class="z-keyword z-operator z-bitwise z-rust">&amp;</span><span class="z-storage z-modifier z-rust">mut</span> pkt</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        <span class="z-support z-type z-rust">Some</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-storage z-modifier z-rust">mut</span> out_pkt<span class="z-punctuation z-separator z-rust">,</span> port</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-rust">=&gt;</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            <span class="z-storage z-type z-rust">Self</span><span class="z-meta z-path z-rust"><span class="z-punctuation z-accessor z-rust">::</span></span>handle_packet_to_ext_port<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                <span class="z-keyword z-operator z-bitwise z-rust">&amp;</span><span class="z-storage z-modifier z-rust">mut</span> out_pkt<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                data_handles<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                port<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                <span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>log<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">            </span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        <span class="z-support z-type z-rust">None</span> <span class="z-keyword z-operator z-rust">=&gt;</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">    </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span></code></pre>
+<p>In the assembly code there is only one control flow instruction between the call
+to <code>handle_packet_to_ext_port</code> and the site of our crash. This must be the match
+statement in the code above which means that the crashing call must be the call
+to <code>process_packet</code>.</p>
+<p>So now the question becomes why is the call to the pipeline a segmentation
+fault. To answer this question we need to look at where the
+<code>pipeline::process_packet</code> address comes from. This is a dynamically loaded
+program trait object. The loading code looks like
+<a href="https://github.com/oxidecomputer/propolis/blob/9952e9701d5d89faa8fe9371a6dc273da9fff6e6/propolis/src/hw/virtio/softnpu.rs#L1397-L1425">this</a>.</p>
+<pre data-lang="rust" class="language-rust z-code"><code class="language-rust" data-lang="rust"><span class="z-source z-rust">async <span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">load_program</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">pipeline</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-meta z-generic z-rust">Arc<span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-meta z-path z-rust">tokio<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">sync<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-generic z-rust">Mutex<span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-meta z-generic z-rust"><span class="z-support z-type z-rust">Option</span><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-meta z-generic z-rust"><span class="z-support z-type z-rust">Box</span><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span>dyn Pipeline<span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust">    <span class="z-variable z-parameter z-rust">log</span><span class="z-punctuation z-separator z-rust">:</span> Logger,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> lib <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-keyword z-control z-rust">match</span> <span class="z-storage z-modifier z-rust">unsafe</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span> <span class="z-meta z-path z-rust">libloading<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">Library<span class="z-punctuation z-accessor z-rust">::</span></span>new<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>/tmp/p4.so<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        <span class="z-support z-type z-rust">Ok</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>l</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-rust">=&gt;</span> l<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        <span class="z-support z-type z-rust">Err</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>e</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-rust">=&gt;</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            <span class="z-support z-macro z-rust">warn!</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>log<span class="z-punctuation z-separator z-rust">,</span> <span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>failed to load p4 program: {}<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span><span class="z-punctuation z-separator z-rust">,</span> e</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            <span class="z-keyword z-control z-rust">return</span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">    </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> func<span class="z-punctuation z-separator z-rust">:</span> <span class="z-meta z-path z-rust">libloading<span class="z-punctuation z-accessor z-rust">::</span></span>Symbol<span class="z-meta z-generic z-rust"><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-generic z-rust">        unsafe <span class="z-keyword z-other z-rust">extern</span> <span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>C<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span> <span class="z-storage z-type z-function z-rust">fn</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span> <span class="z-meta z-function z-return-type z-rust"><span class="z-punctuation z-separator z-rust">-&gt;</span> <span class="z-storage z-modifier z-rust">*mut</span> dyn <span class="z-meta z-path z-rust">p4rs<span class="z-punctuation z-accessor z-rust">::</span></span>Pipeline</span>,
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-generic z-rust">        <span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span> <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-keyword z-control z-rust">match</span> <span class="z-storage z-modifier z-rust">unsafe</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span> lib<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">get</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-storage z-type z-string z-rust">b</span><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>_main_pipeline_create<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            <span class="z-support z-type z-rust">Ok</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>f</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-rust">=&gt;</span> f<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            <span class="z-support z-type z-rust">Err</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>e</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-rust">=&gt;</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">                <span class="z-support z-macro z-rust">warn!</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                    log<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                    <span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>failed to load _main_pipeline_create func: {}<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span><span class="z-punctuation z-separator z-rust">,</span> e
+</span></span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">                </span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">                <span class="z-keyword z-control z-rust">return</span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">            </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> <span class="z-storage z-modifier z-rust">mut</span> pl <span class="z-keyword z-operator z-assignment z-rust">=</span> pipeline<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">lock</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span>await<span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> <span class="z-keyword z-operator z-rust">_</span> <span class="z-keyword z-operator z-assignment z-rust">=</span> pl<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">insert</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-storage z-modifier z-rust">unsafe</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span> <span class="z-support z-type z-rust">Box</span><span class="z-meta z-path z-rust"><span class="z-punctuation z-accessor z-rust">::</span></span>from_raw<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-support z-function z-rust">func</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span></code></pre>
+<p>Reading this code now with the insight of where the crash is occurring, I have a
+guess as to what's happening. At the end of this function the <code>lib</code> function
+gets dropped. Which may unload from this process' memory space, the pipeline
+implementation we are attempting to process packets with at the site of the
+crash. A look at the <a href="https://github.com/nagisa/rust_libloading/blob/master/src/os/unix/mod.rs#L342-L348">drop
+implementation</a>
+for the internal <code>Library</code> data structure used by <code>libloading</code>, we see that
+<code>dlclose</code> is called on drop.</p>
+<p>From the man page of <code>dlclose</code>.</p>
+<blockquote>
+<p>Once an object has been closed by dlclose(), referencing symbols contained in
+that object can cause undefined behavior.</p>
+</blockquote>
+<p><code>dlclose</code>  removes any objects from a corresponding <code>dlopen</code>  from the address
+space of the calling process. This is consistent with what we are seeing.</p>
+
+
+        </div>
+    </section>
+</body>
+
+<html>

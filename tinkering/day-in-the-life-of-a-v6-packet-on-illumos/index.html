@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>Packet Plumbing</title>
+    <link rel="stylesheet" href="/index.css"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+
+<body>
+    <section class="section">
+        <div class="container">
+            
+
+<div class="title">
+    <h1 class="title">
+        A Day in the Life of an IPv6 Packet on illumos
+    </h1>
+</div>
+<div class="subtitle blogsub sectiontitle">
+    <span class="date ">2022-10-22</span>
+    
+    <a class="path" href="/">~</a> /
+    <a class="path" href="/tinkering">tinkering</a> /
+</div>
+<p>This post describes how <a href="https://datatracker.ietf.org/doc/html/rfc2460">IPv6</a>
+packets are transmitted and received on the <a href="https://illumos.org/">illumos</a>
+operating system. We look at the ICMPv6, UDP and TCP protocols.</p>
+<p>All of the tinkering shown in this post is done within a networked testbed
+environment created by the <a href="https://github.com/oxidecomputer/falcon">Falcon</a>
+tool. A repository of the environment and scripts I used for this post is
+available <a href="https://github.com/rcgoodfellow/v6pkt-demo">here</a>.</p>
+<h2 id="icmpv6">ICMPv6</h2>
+<p>Before any TCP or UDP messages can be exchanged between hosts over IPv6,
+<a href="https://datatracker.ietf.org/doc/html/rfc4443">Internet Control Message Protocol Version 6</a>
+packets must be exchanged. In particular,
+<a href="https://datatracker.ietf.org/doc/html/rfc2461">Neighbor Discovery</a>
+protocol (NDP) messages, which are embedded in ICMPv6 packets, are exchanged in
+order for hosts on the same subnet to tell each other what layer-2 MAC addresses
+their layer-3 IPv6 addresses use. This process is generally referred to as
+address resolution, and is handled by the
+<a href="https://www.rfc-editor.org/rfc/rfc826">Address Resolution Protocol</a> (ARP)
+in IPv4.</p>
+<p>When an application asks the operating system (OS) to send an IPv6 packet, the
+OS first checks the destination address of the packet to see if the destination
+is on a local subnet. If not, then the OS consults its routing table in search
+of a gateway address for a router on the local subnet that can forward the
+packet on to its destination. In either case, the OS must determine what the MAC
+address of the <em>nexthop</em> IPv6 address is, in order to form an Ethernet frame
+with the correct destination to send out on the network.</p>
+<p>illumos keeps a table of <em>neighbor cache entries</em> (NCE) that tracks IPv6 to
+link-layer address mappings. For Ethernet, the link-layer address is a MAC
+address. illumos NCE entries are capable of mapping IPv6 addresses onto other
+link-layer protocols, but we'll just be considering Ethernet here.</p>
+<p>In the event that the illumos has an IPv6 packet to send, but does not have an
+NCE entry that tells it what MAC address to use, the OS must resolve the
+destination address using NDP. This involves sending out a <em>neighbor
+solicitation</em>, and awaiting a corresponding <em>neighbor advertisement</em>. Similarly,
+it is the responsibility of the operating system to respond to neighbor
+solicitations for all of its assigned IPv6 addresses.</p>
+<p>The ICMPv6 protocol is also home to the packets employed by the popular
+<a href="https://illumos.org/man/8/ping"><code>ping</code></a>
+program. Ping requests are 
+<a href="https://datatracker.ietf.org/doc/html/rfc4443#section-4.1">Echo Request</a>
+packets. Ping replies are
+<a href="https://datatracker.ietf.org/doc/html/rfc4443#section-4.2">Echo Reply</a>
+packets.</p>
+<p>In our exploration of ICMPv6 packet plumbing on illumos we'll look at both NDP
+and Echo message types. We'll attempt to send Echo messages to destination
+addresses the operating system does not have in its NCE cache, causing an NDP
+exchange before sending of the Echo request packets. We'll look at the mechanics
+from both the transmitting and receiving side of things.</p>
+<h3 id="testbed-setup">Testbed Setup</h3>
+<p>The testbed environment is a simple two node setup. The nodes are directly
+connected to each other.</p>
+<pre class="z-code"><code><span class="z-text z-plain">    +=============+               +==============+
+</span><span class="z-text z-plain">    |             |               |              |
+</span><span class="z-text z-plain">    |         *--------*      *--------*         |
+</span><span class="z-text z-plain">    | violin  | vioif0 |------| vioif0 |  piano  |
+</span><span class="z-text z-plain">    |         *--------*      *--------*         |
+</span><span class="z-text z-plain">    |             |               |              |
+</span><span class="z-text z-plain">    +=============+               +==============+
+</span></code></pre>
+<p>Each node is configured with an IPv6 link-local address. For more on illumos
+IPv6 address machinery see my other post 
+<a href="/tinkering/a-day-in-the-life-of-an-ipv6-address-on-illumos">A Day in the Life of an IPv6 Address on illumos</a>.</p>
+<pre data-lang="shell" class="language-shell z-code"><code class="language-shell" data-lang="shell"><span class="z-text z-plain">ipadm create-addr -T addrconf vioif0/v6
+</span></code></pre>
+<h3 id="transmitting">Transmitting</h3>
+<p>To send out a ping message we're going to write a small program. We could use
+the <code>ping</code> program. But the goal here is to understand how packet flow plumbing
+works end to end, including the user space programming interfaces provided by
+the operating system. Our little program let's us explore this in under 60 lines
+of Rust code. A buildable rust crate for this program is available
+<a href="https://github.com/rcgoodfellow/v6pkt-demo">here</a>.</p>
+<pre data-lang="rust" class="language-rust z-code"><code class="language-rust" data-lang="rust"><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">clap<span class="z-punctuation z-accessor z-rust">::</span></span>Parser<span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">ispf<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>from_bytes_be<span class="z-punctuation z-separator z-rust">,</span> to_bytes_be</span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">serde<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>Deserialize<span class="z-punctuation z-separator z-rust">,</span> Serialize</span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">socket2<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>Domain<span class="z-punctuation z-separator z-rust">,</span> Protocol<span class="z-punctuation z-separator z-rust">,</span> SockAddr<span class="z-punctuation z-separator z-rust">,</span> Socket<span class="z-punctuation z-separator z-rust">,</span> Type</span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">std<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">mem<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>transmute<span class="z-punctuation z-separator z-rust">,</span> MaybeUninit</span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust"><span class="z-keyword z-other z-rust">use</span> <span class="z-meta z-path z-rust">std<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-path z-rust">net<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>Ipv6Addr<span class="z-punctuation z-separator z-rust">,</span> SocketAddrV6</span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span><span class="z-source z-rust">
+</span><span class="z-source z-rust"><span class="z-meta z-annotation z-rust"><span class="z-punctuation z-definition z-annotation z-rust">#</span><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-variable z-annotation z-rust">derive</span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust">Parser</span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-punctuation z-section z-group z-end z-rust">]</span></span>
+</span><span class="z-source z-rust"><span class="z-meta z-annotation z-rust"><span class="z-punctuation z-definition z-annotation z-rust">#</span><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-variable z-annotation z-rust">clap</span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust">version<span class="z-punctuation z-separator z-rust">,</span> about</span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-punctuation z-section z-group z-end z-rust">]</span></span>
+</span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-storage z-type z-struct z-rust">struct</span> </span><span class="z-meta z-struct z-rust"><span class="z-entity z-name z-struct z-rust">Args</span> </span><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-meta z-annotation z-rust"><span class="z-punctuation z-definition z-annotation z-rust">#</span><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-variable z-annotation z-rust">clap</span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust">value_parser</span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-punctuation z-section z-group z-end z-rust">]</span></span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">address</span><span class="z-punctuation z-separator z-type z-rust">:</span> Ipv6Addr,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span><span class="z-source z-rust">
+</span><span class="z-source z-rust"><span class="z-meta z-annotation z-rust"><span class="z-punctuation z-definition z-annotation z-rust">#</span><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-variable z-annotation z-rust">derive</span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust">Debug<span class="z-punctuation z-separator z-rust">,</span> Serialize<span class="z-punctuation z-separator z-rust">,</span> Deserialize<span class="z-punctuation z-separator z-rust">,</span> Default</span></span><span class="z-meta z-annotation z-parameters z-rust"><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-punctuation z-section z-group z-end z-rust">]</span></span>
+</span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-storage z-type z-struct z-rust">struct</span> </span><span class="z-meta z-struct z-rust"><span class="z-entity z-name z-struct z-rust">EchoMessage</span> </span><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">typ</span><span class="z-punctuation z-separator z-type z-rust">:</span> <span class="z-storage z-type z-rust">u8</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">code</span><span class="z-punctuation z-separator z-type z-rust">:</span> <span class="z-storage z-type z-rust">u8</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">checksum</span><span class="z-punctuation z-separator z-type z-rust">:</span> <span class="z-storage z-type z-rust">u16</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">identifier</span><span class="z-punctuation z-separator z-type z-rust">:</span> <span class="z-storage z-type z-rust">u16</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust">    <span class="z-variable z-other z-member z-rust">sequence_number</span><span class="z-punctuation z-separator z-type z-rust">:</span> <span class="z-storage z-type z-rust">u16</span>,
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-struct z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span><span class="z-source z-rust">
+</span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">main</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> sock <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-meta z-path z-rust">Socket<span class="z-punctuation z-accessor z-rust">::</span></span>new<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-meta z-path z-rust">Domain<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-constant z-other z-rust">IPV6</span><span class="z-punctuation z-separator z-rust">,</span> <span class="z-meta z-path z-rust">Type<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-constant z-other z-rust">RAW</span><span class="z-punctuation z-separator z-rust">,</span> <span class="z-support z-type z-rust">Some</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-meta z-path z-rust">Protocol<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-constant z-other z-rust">ICMPV6</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">        <span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>new socket<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-support z-function z-rust">transmit</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-meta z-path z-rust">Args<span class="z-punctuation z-accessor z-rust">::</span></span>parse<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span>address<span class="z-punctuation z-separator z-rust">,</span> <span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>sock</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-support z-function z-rust">receive</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>sock</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span><span class="z-source z-rust">
+</span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">transmit</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span><span class="z-variable z-parameter z-rust">addr</span><span class="z-punctuation z-separator z-rust">:</span> Ipv6Addr, <span class="z-variable z-parameter z-rust">sock</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span>Socket</span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> sa<span class="z-punctuation z-separator z-rust">:</span> SockAddr <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-meta z-path z-rust">SocketAddrV6<span class="z-punctuation z-accessor z-rust">::</span></span>new<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>addr<span class="z-punctuation z-separator z-rust">,</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">0</span><span class="z-punctuation z-separator z-rust">,</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">0</span><span class="z-punctuation z-separator z-rust">,</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">0</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">into</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> message <span class="z-keyword z-operator z-assignment z-rust">=</span> EchoMessage <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        typ<span class="z-punctuation z-separator z-rust">:</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">128</span><span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        identifier<span class="z-punctuation z-separator z-rust">:</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">47</span><span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">        <span class="z-keyword z-operator z-range z-rust">..</span><span class="z-support z-type z-rust">Default</span><span class="z-meta z-path z-rust"><span class="z-punctuation z-accessor z-rust">::</span></span>default<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-block z-rust">    </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> packet_buf <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-support z-function z-rust">to_bytes_be</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>message</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>serialize message<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    sock<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">send_to</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>packet_buf<span class="z-punctuation z-separator z-rust">,</span> <span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>sa</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>icmp send<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span><span class="z-source z-rust">
+</span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-function z-rust"><span class="z-storage z-type z-function z-rust">fn</span> </span><span class="z-entity z-name z-function z-rust">receive</span></span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-begin z-rust">(</span><span class="z-variable z-parameter z-rust">sock</span><span class="z-punctuation z-separator z-rust">:</span> <span class="z-keyword z-operator z-rust">&amp;</span>Socket</span><span class="z-meta z-function z-rust"><span class="z-meta z-function z-parameters z-rust"><span class="z-punctuation z-section z-parameters z-end z-rust">)</span></span></span></span><span class="z-meta z-function z-rust"> </span><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> <span class="z-storage z-modifier z-rust">mut</span> buf <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-meta z-path z-rust">MaybeUninit<span class="z-punctuation z-accessor z-rust">::</span></span>new<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-constant z-numeric z-integer z-decimal z-rust">0</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-separator z-rust">;</span> <span class="z-constant z-numeric z-integer z-decimal z-rust">1024</span><span class="z-punctuation z-section z-group z-end z-rust">]</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> <span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>n<span class="z-punctuation z-separator z-rust">,</span> sender</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> <span class="z-keyword z-operator z-assignment z-rust">=</span> sock<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">recv_from</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-keyword z-operator z-bitwise z-rust">&amp;</span><span class="z-storage z-modifier z-rust">mut</span> buf</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>icmp recv<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> buf <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-storage z-modifier z-rust">unsafe</span> <span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-begin z-rust">{</span> <span class="z-meta z-path z-rust">transmute<span class="z-punctuation z-accessor z-rust">::</span></span><span class="z-meta z-generic z-rust"><span class="z-punctuation z-definition z-generic z-begin z-rust">&lt;</span><span class="z-keyword z-operator z-rust">_</span>, <span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-storage z-type z-rust">u8</span><span class="z-punctuation z-separator z-rust">;</span></span> <span class="z-constant z-numeric z-integer z-decimal z-rust">1024</span><span class="z-punctuation z-section z-group z-end z-rust">]</span><span class="z-punctuation z-definition z-generic z-end z-rust">&gt;</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span>buf</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span> </span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-storage z-type z-rust">let</span> msg<span class="z-punctuation z-separator z-rust">:</span> EchoMessage <span class="z-keyword z-operator z-assignment z-rust">=</span> <span class="z-support z-function z-rust">from_bytes_be</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-keyword z-operator z-bitwise z-rust">&amp;</span>buf<span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">[</span><span class="z-keyword z-operator z-range z-rust">..</span>n<span class="z-punctuation z-section z-group z-end z-rust">]</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>parse icmp<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust">    <span class="z-support z-macro z-rust">println!</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust">
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">        <span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>reply from <span class="z-constant z-other z-placeholder z-rust">{}</span> <span class="z-constant z-other z-placeholder z-rust">{:#?}</span><span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">        sender<span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">as_socket_ipv6</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">expect</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span><span class="z-string z-quoted z-double z-rust"><span class="z-punctuation z-definition z-string z-begin z-rust">&quot;</span>sender sockaddr<span class="z-punctuation z-definition z-string z-end z-rust">&quot;</span></span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-accessor z-dot z-rust">.</span><span class="z-support z-function z-rust">ip</span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-begin z-rust">(</span></span><span class="z-meta z-group z-rust"><span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">        msg<span class="z-punctuation z-separator z-rust">,</span>
+</span></span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"><span class="z-meta z-group z-rust">    <span class="z-punctuation z-section z-group z-end z-rust">)</span></span><span class="z-punctuation z-terminator z-rust">;</span>
+</span></span></span><span class="z-source z-rust"><span class="z-meta z-function z-rust"><span class="z-meta z-block z-rust"></span><span class="z-meta z-block z-rust"><span class="z-punctuation z-section z-block z-end z-rust">}</span></span></span>
+</span></code></pre>
+<p>On the two computers <code>violin</code> and <code>piano</code> we have the following addresses</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# ipadm
+</span><span class="z-text z-plain">ADDROBJ           TYPE     STATE        ADDR
+</span><span class="z-text z-plain">lo0/v4            static   ok           127.0.0.1/8
+</span><span class="z-text z-plain">vioif1/v4         dhcp     ok           192.168.1.201/24
+</span><span class="z-text z-plain">lo0/v6            static   ok           ::1/128
+</span><span class="z-text z-plain">vioif0/v6         addrconf ok           fe80::8:20ff:fe94:4d3a/10
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">root@piano:~# ipadm
+</span><span class="z-text z-plain">ADDROBJ           TYPE     STATE        ADDR
+</span><span class="z-text z-plain">lo0/v4            static   ok           127.0.0.1/8
+</span><span class="z-text z-plain">vioif1/v4         dhcp     ok           192.168.1.202/24
+</span><span class="z-text z-plain">lo0/v6            static   ok           ::1/128
+</span><span class="z-text z-plain">vioif0/v6         addrconf ok           fe80::8:20ff:fe01:aead/10
+</span></code></pre>
+<p>When we use our program to send a ping from <code>violin</code> to <code>piano</code> we see the
+following.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# ./ping fe80::8:20ff:fe01:aead
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span></code></pre>
+<p>This shows us that in response to our echo message (message type <code>128</code>) we got a
+reply (message type <code>128</code>) from our neighbor with an IPv6 link local address
+<code>fe80::8:20ff:fe01:aead</code>.</p>
+<p>Now let's get into the actual plumbing!</p>
+<h4 id="socket-allocation">Socket Allocation</h4>
+<p>In the code above, the first thing we do is open up a
+<a href="https://illumos.org/man/3SOCKET/socket"><code>socket</code></a>.
+The Rust programming interface from the
+<a href="https://docs.rs/socket2/latest/socket2/">socket2</a>
+crate we are using provides the same API as the operating system with a bit of
+type safety sprinkled in using Rust enumerations and options instead of of
+integers. At the end of the day, the <code>socket2</code> Rust crate is using the
+underlying <code>socket</code> function.</p>
+<p>On illumos the primary code path for the <code>socket</code> function is just a wrapper around a
+system call. The
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/lib/libsocket/socket/socket.c#53"><code>socket</code></a>
+function, wraps the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/lib/libsocket/socket/socket.c#93"><code>_socket_create</code></a>
+function, which wraps the syscall
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/lib/libc/common/sys/_so_socket.s#40"><code>_so_socket</code></a>.
+When we land on the other side in the kernel, we arrive at the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/socksyscalls.c#95"><code>so_socket</code></a> function. Our Rust code is calling the <code>socket</code> function with the following parameters.</p>
+<ul>
+<li><code>domain</code>: <a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socket.h#300"><code>AF_INET6</code></a></li>
+<li><code>type</code>: <a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socket.h#111"><code>SOCK_RAW</code></a></li>
+<li><code>protocol</code>: <a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/netinet/in.h#170"><code>IPPROTO_ICMPV6</code></a></li>
+</ul>
+<p>Additionally the <code>_socket_create</code> function sets the following values for the
+syscall.</p>
+<ul>
+<li><code>devpath</code>: <code>NULL</code></li>
+<li><code>version</code>: <a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socketvar.h#383"><code>SOV_DEFAULT</code></a></li>
+</ul>
+<p>Because our <code>devpath</code> is <code>NULL</code>, the first meaningful thing <code>so_socket</code> does is
+call
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon.c#69"><code>socket_create</code></a>. 
+In <code>socket_create</code> the first thing that happens is a
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socketvar.h#461"><code>sockparams</code></a>
+lookup via
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockparams.c#663"><code>solookup</code></a>.
+The <code>sockparams</code> struct maps the <code>(family, type, protocol)</code> triple onto a socket
+module or STREAMS device.</p>
+<p>The <code>sockparams</code> struct contains a
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socketvar.h#435"><code>smod_info</code></a>
+member that contains a <code>so_create_func_t</code> function pointer that allows us to
+create a socket node using the module our <code>(family, type, protocol)</code> triple
+mapped to.</p>
+<p>Taking a look at what functions get mapped to this pointer, there appear to be
+two.</p>
+<ul>
+<li><a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/socktpi.c#276"><code>sotpi_create</code></a></li>
+<li><a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/socksubr.c#254"><code>sock_comm_create_function</code></a> / <a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon_subr.c#1218"><code>socket_sonode_create</code></a></li>
+</ul>
+<p>TPI stands for Transport Provider Interface and appears to be a 
+<a href="http://www.openss7.org/docs/tpi.pdf">very old Unix standard</a>.
+I'm guessing we're using the <code>socket_sonode_create</code> function, but let's use
+<code>dtrace</code> to find out!</p>
+<p>First a quick look to find the exact <code>dtrace</code> probe we need.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -l | grep socket_sonode_create
+</span><span class="z-text z-plain">57129        fbt            sockfs              socket_sonode_create entry
+</span><span class="z-text z-plain">57130        fbt            sockfs              socket_sonode_create return
+</span></code></pre>
+<p>Now let's run the probe</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:sockfs:socket_sonode_create:entry&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:sockfs:socket_sonode_create:entry&#39; matched 1 probe
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1195 has exited
+</span><span class="z-text z-plain">CPU     ID                    FUNCTION:NAME
+</span><span class="z-text z-plain">  1  57129       socket_sonode_create:entry
+</span></code></pre>
+<p>Ok, looks like our intuition was correct. Just as a sanity check let's make sure
+that the TPI function is not being called.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:sockfs:sotpi_create:entry&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:sockfs:sotpi_create:entry&#39; matched 1 probe
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1199 has exited
+</span></code></pre>
+<p>Alrighty, no TPI here.</p>
+<p>The <code>socket_sonode_create</code> function essentially allocates a <code>sonode</code> object and
+fills in various information depending on the socket parameters object, address
+family, etc. See
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon.c#557"><code>sonode_init</code></a>
+for more details. We'll come back to <code>sonode</code> properties as they become relevant
+for packet transmission using the socket.</p>
+<h4 id="sending-packets">Sending Packets</h4>
+<p>The next significant thing that happens in our ping program is a call to
+<code>send_to</code>. Similar to the socket call, the rust <code>send_to</code> method on the <code>Socket</code>
+object corresponds to the sockets library function
+<a href="https://illumos.org/man/3SOCKET/send"><code>sendto</code></a>.</p>
+<p>Similar to the <code>socket</code> call, <code>sendto</code> is a series of wrappers around a syscall
+ultimately landing at the <code>__so_sendto</code> assembly function definition.</p>
+<p>Inside the kernel, the <code>__so_sendto</code> call lands us at
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/socksyscalls.c#1466"><code>sendto</code></a>.
+The <code>sendto</code> function initializes a <code>uio</code> data structure and ultimately calls
+the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/socksyscalls.c#1192"><code>sendit</code></a>
+function.</p>
+<p>We can see that the first thing that happens in <code>sendit</code> is grabbing the
+<code>sonode</code> that was created in <code>so_socket</code> above. Then after a bit of sanity
+checking and further data structure setup calls
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon.c#317"><code>socket_sendmsg</code></a>.
+This function wraps the <code>sop_sendmsg</code> of <code>sonode`so_ops</code> object. The
+<code>sonode`so_ops</code> object comes from a statically defined structure of function
+pointers
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon_sops.c#1934"><code>so_sonodeops</code></a>.
+The function we are currently looking at is
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon_sops.c#342"><code>so_sendmsg</code></a>.</p>
+<p>The first interesting thing that happens here is we are determining if the send
+function of this <code>sonode</code> is flow controlled via <code>SO_SND_FLOWCTRLD</code> and then
+waiting until the send queue for the <code>sonode</code> is not full so we can send data
+through it. Let's use <code>dtrace</code> to see if this is happening with ping program.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:sockfs:so_snd_wait_qnotfull:entry&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:sockfs:so_snd_wait_qnotfull:entry&#39; matched 1 probe
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1223 has exited
+</span></code></pre>
+<p>Ok, so the socket being used for sending our ICMPv6 message is not flow
+controlled. This makes sense. I suspect we'll see this function fire when we get
+to TCP.</p>
+<p>Next, <code>sonode`so_downcalls</code> is inspected to see how we should send the data.
+The options here are sending vectored I/O via
+<a href="https://illumos.org/man/9S/uio"><code>uio</code></a>
+or just using the basic send path for contiguous data.</p>
+<p>These down calls were set up back in the <code>socket_create</code> function via a call to
+the <code>SOP_INIT</code> macro. That macro wraps the <code>sonode`so_ops`sop_init</code> function
+pointer. Recall that <code>sonode`so_ops</code> is a reference to the static
+<code>so_sonodeops</code> structure. In that structure <code>sop_init</code> points to <code>so_init</code> which
+is a wrapper for
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/fs/sockfs/sockcommon_subr.c#1268"><code>socket_init_common</code></a>.</p>
+<p>In <code>socket_init_common</code> the down calls are initialized via
+<code>sockparams`sp_mod_info`smod_proto_create_func</code>. To understand how this
+function gets set, we need to look at the initialization of the underlying
+module that provides the socket's data path. The internet device driver
+interface (DDI)
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/inetddi.c#236">initializes</a>
+a socket module registration structure
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socketvar.h#421"><code>smod_reg_s</code></a>.
+The <code>INET_SOCK_PROTO_CREATE_FUNC</code> is what's of interest here. This macro has
+multiple definitions. What definition is used depends on what kernel driver is
+including this <code>inetddi.c</code> into it's own source and what definition that driver
+has for <code>INET_SOCK_PROTO_CREATE_FUNC</code> :/.</p>
+<p>Currently we're interested in ICMPv6 so we'll be taking a look at the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmpddi.c#42"><code>INET_SOCK_PROTO_CREATE_FUNC</code></a>
+in the <code>ip</code> module. Later on we'll be looking at the <code>tcp</code> and <code>udp</code> module
+definitions of this macro. The
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#5362"><code>rawip_create</code></a>
+function <code>INET_SOCK_PROTO_CREATE_FUNC</code> resolves to in the <code>ip</code> module sets the
+down calls object to
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#5851"><code>sock_rawip_downcalls</code></a>.
+When we cross reference that instantiation with the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/sys/socket_proto.h#99"><code>sock_downcalls_s</code></a>
+structure definition, we can see that the <code>sock_downcalls_s`sd_send_uio</code>
+member is set to <code>NULL</code>. Therefore the send function being used is
+<code>sock_downcalls_s`sd_send</code> which resolves to
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#5632"><code>rawip_send</code></a>.</p>
+<p>The <code>rawip_send</code> function is partitioned into two primary code blocks for IPv4
+and IPv6. After a bit of validation and error checking we land at the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#4384"><code>icmp_output_newdst</code></a>
+function.</p>
+<p>Now we're getting into the meat and potatoes of sending the packet, starting
+with the call to
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/conn_opt.c#2531"><code>ip_attr_connect</code></a>.
+At face value, it's rather curious why we would be calling a function whose name
+implies a connection on a connectionless protocol like ICMP, but let's dive in
+and take a look at what's going on there.</p>
+<p>For IPv6, <code>ip_attr_connect</code> is mostly a wrapper around
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip6.c#1957"><code>ip_set_destination_v6</code></a>.
+In keeping with our present theme of unexpected names, this function does not
+set an IPv6 destination. What this function actually does is:</p>
+<ul>
+<li>Get a routing table entry for the destination address, bailing with an error
+if no route is found, or if the route is something like a black hole entry.</li>
+<li>Set the <em>source</em> address for the outgoing packet under certain conditions.</li>
+<li>Creates a destination cache entry (DCE) for the destination address of the
+packet being sent if one does not already exists.</li>
+<li>Gets a neighbor cache entry (NCE) for the destination IPv6 address.</li>
+</ul>
+<p>This raises the question of what happens when there is no NCE e.g., we don't
+know the MAC address of the destination IPv6 address.</p>
+<p>I've been running around in circles for a bit trying to sort this out, so let's
+let <code>dtrace</code> guide our search a bit. To set things up let's make sure that there
+is no NCE for the destination address we'll ping in the kernel.</p>
+<p>We can see what the current entries are with <code>mdb</code>.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# mdb -ke &quot;::walk nce | ::print nce_t nce_addr&quot;
+</span><span class="z-text z-plain">nce_addr = ff02::1:ff01:aead
+</span><span class="z-text z-plain">nce_addr = fe80::8:20ff:fe01:aead
+</span><span class="z-text z-plain">nce_addr = ff02::1:2
+</span><span class="z-text z-plain">nce_addr = ff02::1
+</span><span class="z-text z-plain">nce_addr = ff02::16
+</span><span class="z-text z-plain">nce_addr = ff02::1:ff94:4d3a
+</span><span class="z-text z-plain">nce_addr = fe80::8:20ff:fe94:4d3a
+</span><span class="z-text z-plain">nce_addr = ff02::2
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.109
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.2
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.1
+</span><span class="z-text z-plain">nce_addr = ::ffff:224.0.0.2
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.255
+</span><span class="z-text z-plain">nce_addr = ::ffff:224.0.0.22
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.201
+</span><span class="z-text z-plain">nce_addr = ::1
+</span><span class="z-text z-plain">nce_addr = ::ffff:127.0.0.1
+</span></code></pre>
+<p>Here we can see that there is an entry for <code>fe80::8:20ff:fe01:aead</code>. When we
+<code>dtrace</code> the <code>ire_to_nce</code> function we see the following.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:ip:ire_to_nce:entry{ stack(); }&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:ip:ire_to_nce:entry&#39; matched 1 probe
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1317 has exited
+</span><span class="z-text z-plain">CPU     ID                    FUNCTION:NAME
+</span><span class="z-text z-plain">  1  53008                 ire_to_nce:entry
+</span><span class="z-text z-plain">              ip`ip_set_destination_v6+0x46b
+</span><span class="z-text z-plain">              ip`ip_attr_connect+0x14a
+</span><span class="z-text z-plain">              ip`icmp_output_newdst+0x1f5
+</span><span class="z-text z-plain">              ip`rawip_send+0x4b7
+</span><span class="z-text z-plain">              sockfs`so_sendmsg+0x24a
+</span><span class="z-text z-plain">              sockfs`socket_sendmsg+0x62
+</span><span class="z-text z-plain">              sockfs`sendit+0x1ab
+</span><span class="z-text z-plain">              sockfs`sendto+0x88
+</span><span class="z-text z-plain">              unix`sys_syscall+0x17d
+</span></code></pre>
+<p>This is the code path we have been walking through up to this point. Now let's
+delete the <code>nce_entry</code> in the kernel and try again. We can do this by removing
+the IP interface associated with these entries.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# ipadm delete-if vioif0
+</span><span class="z-text z-plain">Oct 23 20:54:48 in.ndpd[965]: Interface vioif0 has been removed from kernel. in.ndpd will no longer use it
+</span></code></pre>
+<p>This will wipe out our link local IP address, so we need to create it again.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# ipadm create-addr -T addrconf vioif0/v6
+</span></code></pre>
+<p>Let's use <code>mdb</code> to verify that our target address no longer has an NCE entry.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# mdb -ke &quot;::walk nce | ::print nce_t nce_addr&quot;
+</span><span class="z-text z-plain">nce_addr = ff02::1
+</span><span class="z-text z-plain">nce_addr = fe80::8:20ff:fe94:4d3a
+</span><span class="z-text z-plain">nce_addr = ff02::16
+</span><span class="z-text z-plain">nce_addr = ff02::1:ff94:4d3a
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.109
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.2
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.1
+</span><span class="z-text z-plain">nce_addr = ::ffff:224.0.0.2
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.255
+</span><span class="z-text z-plain">nce_addr = ::ffff:224.0.0.22
+</span><span class="z-text z-plain">nce_addr = ::ffff:192.168.1.201
+</span><span class="z-text z-plain">nce_addr = ff02::2
+</span><span class="z-text z-plain">nce_addr = ::1
+</span><span class="z-text z-plain">nce_addr = ::ffff:127.0.0.1
+</span></code></pre>
+<p>Great, now let's run that <code>dtrace</code> above again.</p>
+<p>Something interesting to note in the <code>icmp_output_newdst</code> function is in the
+call to
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/icmp.c#3986"><code>icmp_prepend_header_template</code></a>.
+Notice in our application code we are not calculating and setting the ICMP
+header checksum. That is done for us in this function. After preparing the
+packet for egress, we land at the
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip_output.c#136"><code>conn_ip_output</code></a>
+function.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:ip:ire_to_nce:entry{ stack(); }&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:ip:ire_to_nce:entry&#39; matched 1 probe
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1323 has exited
+</span><span class="z-text z-plain">CPU     ID                    FUNCTION:NAME
+</span><span class="z-text z-plain">  1  53008                 ire_to_nce:entry
+</span><span class="z-text z-plain">              ip`ip_set_destination_v6+0x46b
+</span><span class="z-text z-plain">              ip`ip_attr_connect+0x14a
+</span><span class="z-text z-plain">              ip`icmp_output_newdst+0x1f5
+</span><span class="z-text z-plain">              ip`rawip_send+0x4b7
+</span><span class="z-text z-plain">              sockfs`so_sendmsg+0x24a
+</span><span class="z-text z-plain">              sockfs`socket_sendmsg+0x62
+</span><span class="z-text z-plain">              sockfs`sendit+0x1ab
+</span><span class="z-text z-plain">              sockfs`sendto+0x88
+</span><span class="z-text z-plain">              unix`sys_syscall+0x17d
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  1  53008                 ire_to_nce:entry
+</span><span class="z-text z-plain">              ip`ip_output_simple_v6+0x152
+</span><span class="z-text z-plain">              ip`ip_output_simple+0x122
+</span><span class="z-text z-plain">              ip`ndp_xmit+0x27d
+</span><span class="z-text z-plain">              ip`ndp_solicit+0xb3
+</span><span class="z-text z-plain">              ip`ip_ndp_resolve+0xfb
+</span><span class="z-text z-plain">              ip`ip_xmit+0xab5
+</span><span class="z-text z-plain">              ip`ire_send_wire_v6+0x126
+</span><span class="z-text z-plain">              ip`conn_ip_output+0x1d4
+</span><span class="z-text z-plain">              ip`icmp_output_newdst+0x644
+</span><span class="z-text z-plain">              ip`rawip_send+0x4b7
+</span><span class="z-text z-plain">              sockfs`so_sendmsg+0x24a
+</span><span class="z-text z-plain">              sockfs`socket_sendmsg+0x62
+</span><span class="z-text z-plain">              sockfs`sendit+0x1ab
+</span><span class="z-text z-plain">              sockfs`sendto+0x88
+</span><span class="z-text z-plain">              unix`sys_syscall+0x17d
+</span></code></pre>
+<p>Interesting, so now we have two code paths running through <code>ire_to_nce</code>. This
+was not actually what I was anticipating seeing (which is consistent with the
+circles I've been running around in for the past little bit) - but it's
+interesting so let's take a look!</p>
+<p>The first code path is identical to the case where the NCE for our destination
+address is already present. The second code path starts to diverge after the
+<code>icmp_output_newdst</code> call. We can see that all the way down in <code>ip_xmit</code> is
+where the logic is to determine if we have an NCE for the destination
+address and what to do if we don't.</p>
+<p>Tracing <code>ip_xmit</code> sheds more light on things.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# dtrace  -n &#39;fbt:ip:ip_xmit:entry{ stack(); }&#39; -c &#39;./ping fe80::8:20ff:fe01:aead&#39;
+</span><span class="z-text z-plain">dtrace: description &#39;fbt:ip:ip_xmit:entry&#39; matched 2 probes
+</span><span class="z-text z-plain">reply from fe80::8:20ff:fe01:aead EchoMessage {
+</span><span class="z-text z-plain">    typ: 129,
+</span><span class="z-text z-plain">    code: 0,
+</span><span class="z-text z-plain">    checksum: 65350,
+</span><span class="z-text z-plain">    identifier: 12032,
+</span><span class="z-text z-plain">    sequence_number: 0,
+</span><span class="z-text z-plain">}
+</span><span class="z-text z-plain">dtrace: pid 1342 has exited
+</span><span class="z-text z-plain">CPU     ID                    FUNCTION:NAME
+</span><span class="z-text z-plain">  3  51734                    ip_xmit:entry
+</span><span class="z-text z-plain">              ip`ire_send_wire_v6+0x126
+</span><span class="z-text z-plain">              ip`conn_ip_output+0x1d4
+</span><span class="z-text z-plain">              ip`icmp_output_newdst+0x644
+</span><span class="z-text z-plain">              ip`rawip_send+0x4b7
+</span><span class="z-text z-plain">              sockfs`so_sendmsg+0x24a
+</span><span class="z-text z-plain">              sockfs`socket_sendmsg+0x62
+</span><span class="z-text z-plain">              sockfs`sendit+0x1ab
+</span><span class="z-text z-plain">              sockfs`sendto+0x88
+</span><span class="z-text z-plain">              unix`sys_syscall+0x17d
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  3  51734                    ip_xmit:entry
+</span><span class="z-text z-plain">              ip`ip_postfrag_loopcheck+0x9c
+</span><span class="z-text z-plain">              ip`ire_send_wire_v6+0x126
+</span><span class="z-text z-plain">              ip`ire_send_multicast_v6+0xa6
+</span><span class="z-text z-plain">              ip`ip_output_simple_v6+0x5de
+</span><span class="z-text z-plain">              ip`ip_output_simple+0x122
+</span><span class="z-text z-plain">              ip`ndp_xmit+0x27d
+</span><span class="z-text z-plain">              ip`ndp_solicit+0xb3
+</span><span class="z-text z-plain">              ip`ip_ndp_resolve+0xfb
+</span><span class="z-text z-plain">              ip`ip_xmit+0xab5
+</span><span class="z-text z-plain">              ip`ire_send_wire_v6+0x126
+</span><span class="z-text z-plain">              ip`conn_ip_output+0x1d4
+</span><span class="z-text z-plain">              ip`icmp_output_newdst+0x644
+</span><span class="z-text z-plain">              ip`rawip_send+0x4b7
+</span><span class="z-text z-plain">              sockfs`so_sendmsg+0x24a
+</span><span class="z-text z-plain">              sockfs`socket_sendmsg+0x62
+</span><span class="z-text z-plain">              sockfs`sendit+0x1ab
+</span><span class="z-text z-plain">              sockfs`sendto+0x88
+</span><span class="z-text z-plain">              unix`sys_syscall+0x17d
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  3  51734                    ip_xmit:entry
+</span><span class="z-text z-plain">              ip`nce_resolv_ok+0xfa
+</span><span class="z-text z-plain">              ip`nce_process+0x168
+</span><span class="z-text z-plain">              ip`ndp_input_advert+0x373
+</span><span class="z-text z-plain">              ip`ndp_input+0x291
+</span><span class="z-text z-plain">              ip`icmp_inbound_v6+0x532
+</span><span class="z-text z-plain">              ip`ip_fanout_v6+0xf62
+</span><span class="z-text z-plain">              ip`ip_input_local_v6+0x1e
+</span><span class="z-text z-plain">              ip`ire_recv_local_v6+0x131
+</span><span class="z-text z-plain">              ip`ill_input_short_v6+0x472
+</span><span class="z-text z-plain">              ip`ip_input_common_v6+0x283
+</span><span class="z-text z-plain">              ip`ip_input_v6+0x1f
+</span><span class="z-text z-plain">              ip`ip_rput_v6+0x71
+</span><span class="z-text z-plain">              unix`putnext+0x233
+</span><span class="z-text z-plain">              dld`dld_str_rx_fastpath+0x37
+</span><span class="z-text z-plain">              dls`i_dls_link_rx+0x311
+</span><span class="z-text z-plain">              mac`mac_rx_deliver+0x2e
+</span><span class="z-text z-plain">              mac`mac_rx_soft_ring_drain+0x115
+</span><span class="z-text z-plain">              mac`mac_soft_ring_worker+0xa1
+</span><span class="z-text z-plain">              unix`thread_start+0xb
+</span></code></pre>
+<p>This shows that in the process of <code>ip_xmit</code>, it was determined that we needed to
+send an NDP solicitation, and what we are seeing in terms of <code>ip_xmit</code> is the
+transmission of that NDP packet, not our ping packet. So let's go figure out
+how and where that is being sent.</p>
+<p>Looking at the <code>ip_xmit</code> code, we see that when the neighbor discovery state is
+<code>ND_INITIAL</code>, the message block that was sent to <code>ip_xmit</code> is queued up via
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip_ndp.c#2985"><code>nce_queue_mp</code></a>.</p>
+<p>A bit of poking around in <code>ip_ndp.c</code> shows that message block queues attached to
+NCEs are transmitted once an NDP round of messages succeeds with 
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip_ndp.c#3099"><code>nce_resolv_ok</code></a>.
+And we can actually see that in the third trace above. Just prior to the
+<code>ip_xmit:entry</code> from <code>dtrace</code> we see <code>ip`nce_resolv_ok</code>. So now we have a
+complete context for our 3 traces above. The first two are the same trace, since
+<code>ip_xmit</code> is called twice in the same call stack, the first time in an attempt
+to send the desired packet, and the second time to send an NDP request in lieu
+of the desired packet. The third trace is kicked off by the reception of an NDP
+advertisement in response to the solicitation we sent out, which results in a
+successful NCE resolution and thus our initial packet that was queued up waiting
+for a good NCE entry goes out the door.</p>
+<p>Now it's time to take a look at how packets leave the <code>ip</code> module on the way out
+the front door. The bulk of this is under the <code>sendit</code> in <code>ip_xmit</code> when the NDP
+state is <code>REACHABLE</code>, <code>STALE</code>, <code>DELAY</code> or <code>PROBE</code>. The first thing that happens
+is attaching a link-layer header to the outgoing packet using
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip.c#12108"><code>ip_xmit_attach_llhdr</code></a>.
+This function checks for a <em>fastpath</em> header located at <code>nce`nce_fp_mp</code>,
+and prepends it to the message block. We can see from <code>mdb</code> that the fastpath
+header is present for the IPv6 address we are pinging. More information on
+fastpath can be found in the blog post
+<a href="http://dtrace.org/blogs/rm/2014/04/03/dlpi-and-the-ip-fastpath/">DLPI and the IP Fastpath</a>.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# mdb -ke &quot;::walk nce | ::print nce_t nce_addr nce_fp_mp&quot;
+</span><span class="z-text z-plain">nce_addr = ff02::2
+</span><span class="z-text z-plain">nce_fp_mp = 0xfffffe0651377a80
+</span><span class="z-text z-plain">nce_addr = ff02::1:ff01:aead
+</span><span class="z-text z-plain">nce_fp_mp = 0xfffffe065a31a380
+</span><span class="z-text z-plain">nce_addr = fe80::8:20ff:fe01:aead
+</span><span class="z-text z-plain">nce_fp_mp = 0xfffffe065a18fa20
+</span><span class="z-text z-plain">&lt;remaining output snipped&gt;
+</span></code></pre>
+<p>After prepending the link-layer header, it's time to send the packet down to the
+next layer. How this is accomplished depends on whether or not the IP lower
+layer (ILL) for the IP interface we are transmitting on supports direct
+transmit. We can use <code>mdb</code> to take a look at the <code>ill_t`ill_capabilities</code>
+value to see if <code>ILL_CAPAB_DLD_DIRECT</code> is set.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# mdb -ke &quot;::walk ill | ::print ill_t ill_name ill_inputfn ill_capabilities&quot;
+</span><span class="z-text z-plain">ill_name = 0xfffffe0659ae2308 &quot;vioif0&quot;
+</span><span class="z-text z-plain">ill_inputfn = ill_input_short_v4
+</span><span class="z-text z-plain">ill_capabilities = 0
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_name = 0xfffffe06587d8d48 &quot;vioif0&quot;
+</span><span class="z-text z-plain">ill_inputfn = ill_input_short_v6
+</span><span class="z-text z-plain">ill_capabilities = 0x30
+</span><span class="z-text z-plain">&lt;non-relevant output snipped&gt;
+</span></code></pre>
+<p>Here we can see that the <code>ill</code> for IPv4 has no capabilities - which I suppose
+makes sense as there is no IPv4 address assigned to this interface. The
+capabilities of the IPv6 <code>ill</code> are set to <code>0x30</code> which indicates
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip.h#1418"><code>ILL_CAPAB_DLD_DIRECT</code></a>
+that has a value of <code>0x80</code> is not enabled.</p>
+<p>Curios to know why direct mode is not enabled for this interface as it is
+enabled for another interface on this system using the same Ethernet driver, I
+found this bit of code for
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/inet/ip/ip_if.c#2113"><code>ill_capability_dld_enable</code></a></p>
+<pre data-lang="c" class="language-c z-code"><code class="language-c" data-lang="c"><span class="z-source z-c"><span class="z-storage z-modifier z-c">static</span> <span class="z-storage z-type z-c">void</span>
+</span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-entity z-name z-function z-c">ill_capability_dld_enable</span></span><span class="z-meta z-function z-parameters z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function z-parameters z-c"><span class="z-meta z-group z-c">ill_t <span class="z-keyword z-operator z-c">*</span><span class="z-variable z-parameter z-c">ill</span><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-meta z-function z-c">
+</span></span><span class="z-source z-c"><span class="z-meta z-function z-c"></span><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-begin z-c">{</span></span></span><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	mac_perim_handle_t mph<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ASSERT</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">IAM_WRITER_ILL</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ill_mac_perim_enter</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill<span class="z-punctuation z-separator z-c">,</span> <span class="z-keyword z-operator z-c">&amp;</span>mph</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	<span class="z-keyword z-control z-c">if</span> <span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span><span class="z-keyword z-operator z-arithmetic z-c">!</span>ill<span class="z-punctuation z-accessor z-c">-&gt;</span>ill_isv6<span class="z-punctuation z-section z-group z-end z-c">)</span></span> <span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-begin z-c">{</span>
+</span></span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"><span class="z-meta z-block z-c">		<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ill_capability_direct_enable</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"><span class="z-meta z-block z-c">		<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ill_capability_poll_enable</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"><span class="z-meta z-block z-c">	<span class="z-punctuation z-section z-block z-end z-c">}</span></span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ill_capability_lso_enable</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	ill<span class="z-punctuation z-accessor z-c">-&gt;</span>ill_capabilities <span class="z-keyword z-operator z-assignment z-augmented z-c">|=</span> ILL_CAPAB_DLD<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c">	<span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ill_mac_perim_exit</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ill<span class="z-punctuation z-separator z-c">,</span> mph</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"></span></span><span class="z-meta z-function z-c"><span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-end z-c">}</span></span></span>
+</span></code></pre>
+<p>So the direct mode capability is never enabled for IPv6 hmm.... Let's try to
+figure out why that is. There is a fair amount of indirection going on with this
+capability, let's see if <code>mdb</code> can give is a picture of what
+<code>ill_t`ill_dld_capab`idc_direct`idd_tx_df</code> looks like for a current <code>ill</code> on
+the system.</p>
+<pre class="z-code"><code><span class="z-text z-plain">root@violin:~# mdb -ke &quot;::walk ill | ::print ill_t ill_dld_capab | ::print ill_dld_capab_t idc_direct&quot;
+</span><span class="z-text z-plain">idc_direct = {
+</span><span class="z-text z-plain">    idc_direct.idd_tx_df = str_mdata_fastpath_put
+</span><span class="z-text z-plain">    idc_direct.idd_tx_dh = 0xfffffe065115eab8
+</span><span class="z-text z-plain">    idc_direct.idd_tx_cb_df = mac_client_tx_notify
+</span><span class="z-text z-plain">    idc_direct.idd_tx_cb_dh = 0xfffffe0646de8b38
+</span><span class="z-text z-plain">    idc_direct.idd_tx_fctl_df = mac_tx_is_flow_blocked
+</span><span class="z-text z-plain">    idc_direct.idd_tx_fctl_dh = 0xfffffe0646de8b38
+</span><span class="z-text z-plain">}
+</span></code></pre>
+<p>Ok, there is nothing that stands out as particularly IPv4 specific in
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/io/dld/dld_str.c#864"><code>str_mdata_fastpath_put</code></a>.
+Something that is problematic is that <code>ill_t`ill_dld_capab`idc_capab_df</code> which
+gets set to
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/io/dld/dld_proto.c#1525"><code>dld_capab</code></a>
+bails with <code>ENOTSUP</code> if <code>DLD_CAPAB_DIRECT</code> is being set for a service attachment
+point (SAP) with <code>ETHERTYPE_IPV6</code>. Dropping down into
+<a href="https://code.illumos.org/plugins/gitiles/illumos-gate/+/refs/heads/master/usr/src/uts/common/io/dld/dld_proto.c#1356"><code>dld_capab_direct</code></a>
+we can see <code>dld_capab_direct_t`di_tx_df</code> getting set to
+<code>str_mdata_fastpath_put</code> which lines up with what we saw in <code>mdb</code> previously.
+Let's dig a bit deeper into <code>str_mdata_fastpath_put</code> by dropping down into
+<code>DLD_TX</code>. This is a macro that wraps <code>mac_tx</code>. Not immediately seeing any deal
+breakers for IPv6 their either ...</p>
+<p><strong><em>To be continued ...</em></strong></p>
+<h3 id="receiving">Receiving</h3>
+<h2 id="udp">UDP</h2>
+<h3 id="transmitting-1">Transmitting</h3>
+<h3 id="receiving-1">Receiving</h3>
+<h2 id="tcp">TCP</h2>
+<h3 id="transmitting-2">Transmitting</h3>
+<h3 id="receiving-2">Receiving</h3>
+
+
+        </div>
+    </section>
+</body>
+
+<html>

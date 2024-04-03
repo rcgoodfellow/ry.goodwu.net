@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+        <loc>https://ry.goodwu.net/</loc>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/architecture/</loc>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/architecture/the-programmable-data-plane-and-the-os/</loc>
+        <lastmod>2022-02-22</lastmod>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/tinkering/</loc>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/tinkering/a-day-in-the-life-of-an-ipv6-address-on-illumos/</loc>
+        <lastmod>2022-01-25</lastmod>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/tinkering/day-in-the-life-of-a-v6-packet-on-illumos/</loc>
+        <lastmod>2022-10-22</lastmod>
+    </url>
+    <url>
+        <loc>https://ry.goodwu.net/tinkering/debugging-a-core-dump-with-mdb/</loc>
+        <lastmod>2022-08-29</lastmod>
+    </url>
+</urlset>

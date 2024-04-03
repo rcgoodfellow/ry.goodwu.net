@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>Packet Plumbing</title>
+    <link rel="stylesheet" href="/index.css"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+
+<body>
+    <section class="section">
+        <div class="container">
+            
+
+<div class="title">
+    <h1 class="title">
+        A Day in the Life of an IPv6 Address on illumos
+    </h1>
+</div>
+<div class="subtitle blogsub sectiontitle">
+    <span class="date ">2022-01-25</span>
+    
+    <a class="path" href="/">~</a> /
+    <a class="path" href="/tinkering">tinkering</a> /
+</div>
+<p>This post provides a guided tour of what goes on inside the <a href="https://illumos.org/">illumos</a> operating system when an <a href="https://datatracker.ietf.org/doc/html/rfc2460">IPv6</a> address is added. On illumos, the user-space utilities that manage <a href="https://datatracker.ietf.org/doc/html/rfc1122#section-2">link-layer</a> and <a href="https://datatracker.ietf.org/doc/html/rfc1122#section-3">IP-layer</a> interfaces are included in the OS. We'll walk through the code that does the following.</p>
+<ul>
+<li>Adds IP-layer interfaces on top of link-layer interfaces in <a href="https://illumos.org/man/1M/ipadm"><code>ipadm</code></a>.</li>
+<li>Manages IP-layer state in <code>ipmgmtd</code>.</li>
+<li>Acts as the connective tissue between the link-layer and the IP-layer by implementing the <a href="https://datatracker.ietf.org/doc/html/rfc4861">neighbor discovery protocol</a> in <a href="https://illumos.org/man/1M/in.ndpd"><code>in.ndpd</code></a>.</li>
+</ul>
+<p>On illumos, link-layer and IP-layer interfaces are distinct elements. For brevity, in the rest of this article, I'll refer to the link-layer as L2 and the IP layer as L3. This post will walk through what happens when a <a href="https://datatracker.ietf.org/doc/html/rfc4291#section-2.5.6">link-local</a> IPv6 address is created. Other types of addresses are touched upon along the way, as the process and code involved is very similar.</p>
+<h2 id="creating-an-ipv6-address">Creating an IPv6 Address</h2>
+<p>Link-local addresses allow two hosts on the same link to communicate. This could mean two hosts that are directly connected by an <a href="https://en.wikipedia.org/wiki/Ethernet">Ethernet</a> cable, or it could be a group of hosts connected to an Ethernet switch. A defining characteristic of a <em>link</em> is that L2 frames with a broadcast destination address are delivered to all hosts on the link. This is often referred to as a broadcast domain.</p>
+<p>Link-local addresses have the following form.</p>
+<pre class="z-code"><code><span class="z-text z-plain">     |&lt;--interface id---&gt;|
+</span><span class="z-text z-plain">fe80::XXXX:XXXX:XXXX:XXXX/10
+</span></code></pre>
+<p>On illumos, link-local addresses are called <strong><em>addrconf</em></strong> addresses. Before creating one, let's look at the network state on the two machines in our testing lab. This lab has two machines, violin and piano, connected to each other on their first interface and to a common lab network on their second interface.</p>
+<pre class="z-code"><code><span class="z-text z-plain">dladm
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">LINK        CLASS     MTU    STATE    BRIDGE     OVER
+</span><span class="z-text z-plain">vioif0      phys      1500   up       --         --
+</span><span class="z-text z-plain">vioif1      phys      1500   up       --         --
+</span></code></pre>
+<p>The output above shows we have two L2 interfaces on this machine.</p>
+<pre class="z-code"><code><span class="z-text z-plain">ipadm
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">ADDROBJ           TYPE     STATE        ADDR
+</span><span class="z-text z-plain">lo0/v4            static   ok           127.0.0.1/8
+</span><span class="z-text z-plain">vioif1/v4         dhcp     ok           10.47.0.186/24
+</span><span class="z-text z-plain">lo0/v6            static   ok           ::1/128
+</span></code></pre>
+<p>This shows that the host has the expected IPv4 and IPv6 localhost addresses on the loopback interface <code>lo0</code>, and a DHCP address on the interface <code>vioif1/v4</code> which is on our lab network. The L2 interface <code>vioif0</code> does not yet have an L3 address, so it does not appear in <code>ipadm</code>.</p>
+<p>To create a link-local address on the <code>vioif0</code> interface, we run the following command.</p>
+<pre class="z-code"><code><span class="z-text z-plain">ipadm create-addr -t -T addrconf vioif1/v6
+</span></code></pre>
+<p>The <code>-t</code> option indicates this is a temporary address that will not be preserved across reboots. The <code>-T addrconf</code> option indicates we're requesting a link-local address. The source code for <code>ipadm</code> is <a href="https://github.com/illumos/illumos-gate/tree/master/usr/src/cmd/cmd-inet/usr.sbin/ipadm">here</a>. But before jumping in, we're going to use <a href="https://illumos.org/books/dtrace/chp-user.html"><code>dtrace</code></a> to give us a high-level view of the code paths involved.</p>
+<p>The following is a simple DTrace script that will give us a call graph of every function called in the <code>libipadm</code> library that results from our <code>ipadm</code> command when combined with the <code>-F</code> flag. </p>
+<pre data-lang="dtrace" class="language-dtrace z-code"><code class="language-dtrace" data-lang="dtrace"><span class="z-text z-plain">pid$target:libipadm.so::entry,
+</span><span class="z-text z-plain">pid$target:libipadm.so::return {}
+</span></code></pre>
+<p>We can now create a link-local address on <code>vioif1</code> and trace the resulting execution through <code>libipadm</code> as follows.</p>
+<pre class="z-code"><code><span class="z-text z-plain">dtrace -Fs trace.d -c &quot;ipadm create-addr -t -T addrconf vioif0/v6&quot;
+</span></code></pre>
+<p>The following is an abbreviated version of the output from this trace. The reader is encouraged to try this out and look at the full output. The output below will guide us through our tour of the code that creates this local address.</p>
+<pre class="z-code"><code><span class="z-text z-plain">&lt;&gt; ipadm_open
+</span><span class="z-text z-plain">&lt;&gt; ipadm_create_addrobj
+</span><span class="z-text z-plain">-&gt; ipadm_create_addr
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  -&gt; i_ipadm_lookupadd_addrobj
+</span><span class="z-text z-plain">    &lt;&gt; ipadm_door_call
+</span><span class="z-text z-plain">  &lt;- i_ipadm_lookupadd_addrobj
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  -&gt; i_ipadm_create_if
+</span><span class="z-text z-plain">    &lt;&gt; ipadm_if_enabled
+</span><span class="z-text z-plain">    -&gt; i_ipadm_if_pexists
+</span><span class="z-text z-plain">      -&gt; i_ipadm_persist_if_info
+</span><span class="z-text z-plain">        &lt;&gt; ipadm_door_call
+</span><span class="z-text z-plain">      &lt;- i_ipadm_persist_if_info
+</span><span class="z-text z-plain">    &lt;- i_ipadm_if_pexists
+</span><span class="z-text z-plain">    -&gt; i_ipadm_plumb_if
+</span><span class="z-text z-plain">      &lt;&gt; i_ipadm_slifname
+</span><span class="z-text z-plain">      &lt;&gt; ipadm_open_arp_on_udp
+</span><span class="z-text z-plain">      -&gt; i_ipadm_disable_autoconf
+</span><span class="z-text z-plain">        -&gt; i_ipadm_send_ndpd_cmd
+</span><span class="z-text z-plain">          &lt;&gt; ipadm_ndpd_write
+</span><span class="z-text z-plain">          &lt;&gt; ipadm_ndpd_read
+</span><span class="z-text z-plain">        &lt;- i_ipadm_send_ndpd_cmd
+</span><span class="z-text z-plain">      &lt;- i_ipadm_disable_autoconf
+</span><span class="z-text z-plain">    &lt;- i_ipadm_plumb_if
+</span><span class="z-text z-plain">  &lt;- i_ipadm_create_if
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">  -&gt; i_ipadm_create_ipv6addrs
+</span><span class="z-text z-plain">    -&gt; i_ipadm_create_linklocal
+</span><span class="z-text z-plain">      &lt;&gt; i_ipadm_do_addif
+</span><span class="z-text z-plain">      -&gt; i_ipadm_setlifnum_addrobj
+</span><span class="z-text z-plain">        &lt;&gt; ipadm_door_call
+</span><span class="z-text z-plain">      &lt;- i_ipadm_setlifnum_addrobj
+</span><span class="z-text z-plain">      &lt;&gt; i_ipadm_addrobj2lifname
+</span><span class="z-text z-plain">    &lt;- i_ipadm_create_linklocal
+</span><span class="z-text z-plain">    -&gt; i_ipadm_send_ndpd_cmd
+</span><span class="z-text z-plain">      &lt;&gt; ipadm_ndpd_write
+</span><span class="z-text z-plain">      &lt;&gt; ipadm_ndpd_read
+</span><span class="z-text z-plain">    &lt;- i_ipadm_send_ndpd_cmd
+</span><span class="z-text z-plain">    -&gt; i_ipadm_addr_persist
+</span><span class="z-text z-plain">      &lt;&gt; i_ipadm_add_intfid2nvl
+</span><span class="z-text z-plain">      -&gt; i_ipadm_addr_persist_nvl
+</span><span class="z-text z-plain">        &lt;&gt; ipadm_door_call
+</span><span class="z-text z-plain">      &lt;- i_ipadm_addr_persist_nvl
+</span><span class="z-text z-plain">    &lt;- i_ipadm_addr_persist
+</span><span class="z-text z-plain">  &lt;- i_ipadm_create_ipv6addrs
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">&lt;- ipadm_create_addr
+</span><span class="z-text z-plain">&lt;&gt; ipadm_destroy_addrobj
+</span><span class="z-text z-plain">&lt;&gt; ipadm_close
+</span></code></pre>
+<p>Before jumping into the code, let's look at the result of our <code>ipadm create-addr</code> call.</p>
+<pre class="z-code"><code><span class="z-text z-plain">ipadm show-addr vioif0/v6
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">ADDROBJ           TYPE     STATE        ADDR
+</span><span class="z-text z-plain">vioif0/v6         addrconf ok           fe80::8:20ff:fe11:bddf/10
+</span></code></pre>
+<p>This address conforms to the format described at the beginning of this section. The interface-id is derived from the MAC address of the L2 interface.</p>
+<pre class="z-code"><code><span class="z-text z-plain">dladm show-phys -m vioif0
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">LINK         SLOT     ADDRESS            INUSE CLIENT
+</span><span class="z-text z-plain">vioif0       primary  2:8:20:11:bd:df    yes  vioif0
+</span></code></pre>
+<p>This particular way of translating a MAC address into an IPv6 link-local address results in a 64-bit extended unique identifier or <a href="https://datatracker.ietf.org/doc/html/rfc4291#section-2.5.1">EUI-64</a>. It places the two-octet sequence <code>ff:fe</code> between the leading and trailing three octets of the 48-bit MAC address, forming a 64-bit identifier. Then the 7th leading bit is inverted. We can see this above, where the leading <code>2 = 0b00000010</code> has its 7th bit inverted and becomes <code>0 = 0b00000000</code>. </p>
+<p>Five primary things are happening in creating this IP address.</p>
+<pre class="z-code"><code><span class="z-text z-plain">┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐
+</span><span class="z-text z-plain">│  create   │   │  create   │   │  inform   │   │  create   │   │   addr    │
+</span><span class="z-text z-plain">│  addrobj  │──▶│    if     │──▶│   ndp     │──▶│   addr    │──▶│  persist  │
+</span><span class="z-text z-plain">└───────────┘   └───────────┘   └───────────┘   └───────────┘   └───────────┘
+</span></code></pre>
+<h3 id="address-objects">Address Objects</h3>
+<p>An <code>addrobj</code> collects various information about an address as it goes through the stages of creation. This object is passed around to multiple subsystems within <code>libipadm</code> as the process of creating the address unfolds. The first step of creating an address is allocating and populating an initial set of fields in this struct in <code>ipadm_create_addrobj</code>. The code below only contains one address type <code>ipadm_ipv6_intfid_s</code> which is yet another name for IPv6 link-local address on illumos. In the actual <code>ipadm_addrobj_s</code> struct, there are several more address types in the <code>ipadm_addr_u</code> union that we'll look at later.</p>
+<pre data-lang="c" class="language-c z-code"><code class="language-c" data-lang="c"><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-storage z-type z-c">struct</span> <span class="z-meta z-struct z-c"><span class="z-entity z-name z-struct z-c">ipadm_addrobj_s</span></span></span><span class="z-meta z-struct z-c"> <span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-begin z-c">{</span></span></span><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        <span class="z-storage z-type z-c">char</span>                    ipadm_ifname<span class="z-meta z-brackets z-c"><span class="z-punctuation z-section z-brackets z-begin z-c">[</span>LIFNAMSIZ<span class="z-punctuation z-section z-brackets z-end z-c">]</span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        <span class="z-support z-type z-stdint z-c">int32_t</span>                 ipadm_lifnum<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        <span class="z-storage z-type z-c">char</span>                    ipadm_aobjname<span class="z-meta z-brackets z-c"><span class="z-punctuation z-section z-brackets z-begin z-c">[</span>IPADM_AOBJSIZ<span class="z-punctuation z-section z-brackets z-end z-c">]</span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        ipadm_addr_type_t       ipadm_atype<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        <span class="z-support z-type z-stdint z-c">uint32_t</span>                ipadm_flags<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        sa_family_t             ipadm_af<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">        <span class="z-meta z-union z-c"><span class="z-storage z-type z-c">union</span> <span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-begin z-c">{</span></span></span><span class="z-meta z-union z-c"><span class="z-meta z-block z-c">
+</span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c">                <span class="z-meta z-struct z-c"><span class="z-storage z-type z-c">struct</span> <span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-begin z-c">{</span></span></span><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">
+</span></span></span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">                        <span class="z-storage z-type z-c">struct</span> sockaddr_in6     ipadm_intfid<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">                        <span class="z-support z-type z-stdint z-c">uint32_t</span>                ipadm_intfidlen<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">                        boolean_t               ipadm_stateless<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">                        boolean_t               ipadm_stateful<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c">                </span></span><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-end z-c">}</span></span></span> ipadm_ipv6_intfid_s<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-meta z-union z-c"><span class="z-meta z-block z-c">        </span></span><span class="z-meta z-union z-c"><span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-end z-c">}</span></span></span> ipadm_addr_u<span class="z-punctuation z-terminator z-c">;</span>
+</span></span></span><span class="z-source z-c"><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"></span></span><span class="z-meta z-struct z-c"><span class="z-meta z-block z-c"><span class="z-punctuation z-section z-block z-end z-c">}</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></code></pre>
+<h3 id="ip-interfaces">IP Interfaces</h3>
+<p>Next comes creating the IP interface. This code path may or may not execute depending on whether an IP interface exists for the specified L2 interface. When an address is requested for an L2 device, the code in <code>i_ipadm_create_if</code> checks to see if an IP interface exists for the given L2 interface. If it does, the requested address can be created immediately. If an IP interface does not exist, one must be <em>plumbed</em> onto the L2 interface. This is done in <code>i_ipadm_plumb_if</code>.</p>
+<p>The process of plumbing an L2 interface for IP is depicted in the following simplified code. Readers are encouraged to look over the actual <code>i_ipadm_plumb_if</code> code.</p>
+<pre data-lang="c" class="language-c z-code"><code class="language-c" data-lang="c"><span class="z-source z-c"><span class="z-storage z-type z-c">char</span> <span class="z-keyword z-operator z-c">*</span>ifname<span class="z-punctuation z-terminator z-c">;</span> <span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> This is the name of the L2 interface
+</span></span><span class="z-source z-c">dlpi_handle_t dh_ip<span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c"><span class="z-storage z-type z-c">int</span> dlpi_fd<span class="z-punctuation z-separator z-c">,</span> mux_fd<span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c">
+</span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> Open a data link provider interface (DLPI) instance on the L2 interface.
+</span></span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> A DLPI instance can be thought of as an L2 analogue to a socket.
+</span></span><span class="z-source z-c"><span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">dlpi_open</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">ifname<span class="z-punctuation z-separator z-c">,</span> <span class="z-keyword z-operator z-c">&amp;</span>dh_ip<span class="z-punctuation z-separator z-c">,</span> DLPI_NOATTACH</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c">dlpi_fd <span class="z-keyword z-operator z-assignment z-c">=</span> <span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">dlpi_fd</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">dh_ip</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c">
+</span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> Push the IP STREAMS module onto the L2 device
+</span></span><span class="z-source z-c"><span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ioctl</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">dlpi_fd<span class="z-punctuation z-separator z-c">,</span> I_PUSH<span class="z-punctuation z-separator z-c">,</span> IP_MOD_NAME</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c">
+</span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> This call issues a SIOCSLIFNAME ioctl to the kernel. This sets the ill_name 
+</span></span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> entry in the kernel that we we&#39;ll look at with `mdb` in the next section. To 
+</span></span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> see this in action check out the kernel function `ip_sioctl_slifname`.
+</span></span><span class="z-source z-c"><span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">i_ipadm_slifname</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">iph<span class="z-punctuation z-separator z-c">,</span> ifname<span class="z-punctuation z-separator z-c">,</span> <span class="z-constant z-language z-c">NULL</span><span class="z-punctuation z-separator z-c">,</span> IFF_IPV6<span class="z-punctuation z-separator z-c">,</span> dlpi_fd<span class="z-punctuation z-separator z-c">,</span> <span class="z-constant z-numeric z-integer z-decimal z-c">0</span></span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c">
+</span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> Open the UDP pseudo-device to get a reference to the IP multiplexer. Then
+</span></span><span class="z-source z-c"><span class="z-comment z-line z-double-slash z-c"><span class="z-punctuation z-definition z-comment z-c">//</span> link the DLPI+IP stream below the multiplexer.
+</span></span><span class="z-source z-c">mux_fd <span class="z-keyword z-operator z-assignment z-c">=</span> <span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">open</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">UDP6_DEV_NAME<span class="z-punctuation z-separator z-c">,</span> O_RDRW</span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span><span class="z-source z-c"><span class="z-meta z-function-call z-c"><span class="z-variable z-function z-c">ioctl</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-begin z-c">(</span></span></span><span class="z-meta z-function-call z-c"><span class="z-meta z-group z-c">mux_fd<span class="z-punctuation z-separator z-c">,</span> I_PLINK<span class="z-punctuation z-separator z-c">,</span> dlpi_fd</span><span class="z-meta z-group z-c"><span class="z-punctuation z-section z-group z-end z-c">)</span></span></span><span class="z-punctuation z-terminator z-c">;</span>
+</span></code></pre>
+<p>The STREAMS plumbing that's being done here is visualized in the diagram below. The diagram is read from left to right. The <code>dlpi_open</code> call in the code above gives us a reference to a DLPI instance that is associated with the physical device <code>vioif1</code> (going back to our original <code>ipadm create-addr</code> call at the beginning of this section). The <code>ioctl(dlpi_fd, I_PUSH, IP_MOD_NAME)</code> pushes the IP module onto the DLPI driver instance. Then <code>open(UDP6_DEV_NAME, O_RDRW)</code> gets us a reference to the system's UDP STREAMS module which is attached to the system's IP multiplexer. Then we use <code>ioctl(mux_fd, I_PLINK, dlpi_fd)</code> to attach the data-link driver for <code>vioif1</code> into the system's IP multiplexer.</p>
+<pre class="z-code"><code><span class="z-text z-plain">            │            │              ┏━━━━━━━━┓    │       ┌────────┐       
+</span><span class="z-text z-plain">            │            │              ┃  UDP   ┃    │       │  UDP   │       
+</span><span class="z-text z-plain">            │            │              ┃ module ┃    │       │ module │       
+</span><span class="z-text z-plain">            │            │              ┗━━━━━━━━┛    │       └────────┘       
+</span><span class="z-text z-plain">            │            │              ┏━━━━━━━━┓    │       ┌────────┐       
+</span><span class="z-text z-plain">            │            │              ┃   IP   ┃    │       │   IP   │       
+</span><span class="z-text z-plain">            │            │           ┏━━┫ driver ┣━━┓ │ ┏━━━━━┫ driver ┣━━━━━━┓
+</span><span class="z-text z-plain">            │            │           ┃  ┗━━━━━━━━┛  ┃ │ ┃     └────────┘      ┃
+</span><span class="z-text z-plain">            │            │           ┃IP multiplexer┃ │ ┃   IP multiplexer    ┃
+</span><span class="z-text z-plain">            │ ┏━━━━━━━━┓ │ ┌────────┐┃  ┏━━━━━━━━┓  ┃ │ ┃┏━━━━━━━━┓ ┌────────┐┃
+</span><span class="z-text z-plain">            │ ┃   IP   ┃ │ │   IP   │┗━━┫   IP   ┣━━┛ │ ┗┫   IP   ┣━┫   IP   ┣┛
+</span><span class="z-text z-plain">            │ ┃ module ┃ │ │ module │   ┃ module ┃    │  ┃ module ┃ │ module │ 
+</span><span class="z-text z-plain">            │ ┗━━━━━━━━┛ │ └────────┘   ┗━━━━━━━━┛    │  ┗━━━━━━━━┛ └────────┘ 
+</span><span class="z-text z-plain"> ┏━━━━━━━━┓ │ ┌────────┐ │ ┌────────┐   ┏━━━━━━━━┓    │  ┌────────┐ ┌────────┐ 
+</span><span class="z-text z-plain"> ┃  DLPI  ┃ │ │  DLPI  │ │ │  DLPI  │   ┃  DLPI  ┃    │  │  DLPI  │ │  DLPI  │ 
+</span><span class="z-text z-plain"> ┃ driver ┃ │ │ driver │ │ │ driver │   ┃ driver ┃    │  │ driver │ │ driver │ 
+</span><span class="z-text z-plain"> ┗━━━━━━━━┛ │ └────────┘ │ └────────┘   ┗━━━━━━━━┛    │  └────────┘ └────────┘ 
+</span><span class="z-text z-plain"> ╔════════╗ │ ╔════════╗ │ ╔════════╗   ╔════════╗    │  ╔════════╗ ╔════════╗ 
+</span><span class="z-text z-plain"> ║ vioif1 ║ │ ║ vioif1 ║ │ ║ vioif1 ║   ║ vioif0 ║    │  ║ vioif1 ║ ║ vioif0 ║ 
+</span><span class="z-text z-plain"> ╚════════╝ │ ╚════════╝ │ ╚════════╝   ╚════════╝    │  ╚════════╝ ╚════════╝ 
+</span><span class="z-text z-plain">----------------------------------------------------------------------------------
+</span><span class="z-text z-plain"> dlpi_open  │   I_PUSH   │    open(UDP6_DEV_NAME)     │         I_PLINK        
+</span></code></pre>
+<p>When the IP module for the L2 interface being plumbed is created via <code>I_PUSH</code>, the module's open routine <code>ip_open</code> is called. This results in <code>ip_modopen</code> being called, which creates an <strong><em>IP lower level structure</em></strong> (<code>ill</code>) in the kernel's <code>ill</code> list. The <code>ill</code> is used in IP address assignment and will be discussed in the next section.</p>
+<h3 id="addresses">Addresses</h3>
+<p>The function that actually creates the link-local address is <code>i_ipadm_create_linklocal</code>.  This function eventually makes an <code>ioctl</code> down to the kernel with the <code>SIOCSLIFPREFIX</code> command, which is handled by the <code>ip_sioctl_prefix</code> kernel function. This kernel function first gets a reference to the <strong><em>IP lower level structure</em></strong> (<code>ill</code>) from the <strong><em>IP interface structure</em></strong> (<code>ipif</code>) that is provided to the <code>ioctl</code> handler. The <code>ill</code> contains something called an <code>ill_token</code> that contains the IPv6 ID for the interface in question. This IPv6 ID is combined with the <code>fe80</code> prefix generated in <code>i_ipadm_create_linklocal</code> to create the complete link-local address.</p>
+<p>There is another development tool for illumos that allows us to look at all the <code>ipif</code>/<code>ill</code> entries in the kernel called the modular debugger <a href="https://illumos.org/books/mdb/preface.html"><code>mdb</code></a>. Let's use this tool to look at the <code>ill_token</code> value for each <code>ill</code> entry in the kernel.</p>
+<pre class="z-code"><code><span class="z-text z-plain">mdb -k -e &quot;::walk ill | ::print ill_t ill_isv6 ill_name ill_token&quot;
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">ill_isv6 = 0
+</span><span class="z-text z-plain">ill_name = 0xfffffe038731c368 &quot;lo0&quot;
+</span><span class="z-text z-plain">ill_token = ::
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_isv6 = 0
+</span><span class="z-text z-plain">ill_name = 0xfffffe038e13c288 &quot;vioif0&quot;
+</span><span class="z-text z-plain">ill_token = ::
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_isv6 = 0
+</span><span class="z-text z-plain">ill_name = 0xfffffe0386ebb308 &quot;vioif1&quot;
+</span><span class="z-text z-plain">ill_token = ::
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_isv6 = 0x1
+</span><span class="z-text z-plain">ill_name = 0xfffffe03873f9fa8 &quot;lo0&quot;
+</span><span class="z-text z-plain">ill_token = ::
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_isv6 = 0x1
+</span><span class="z-text z-plain">ill_name = 0xfffffe0390e9ad48 &quot;vioif0&quot;
+</span><span class="z-text z-plain">ill_token = ::8:20ff:fe11:bddf
+</span><span class="z-text z-plain">ill_isv6 = 0x1
+</span><span class="z-text z-plain">
+</span><span class="z-text z-plain">ill_name = 0xfffffe03890a9d48 &quot;vioif1&quot;
+</span><span class="z-text z-plain">ill_token = ::8:20ff:fed7:fccf
+</span></code></pre>
+<p>This shows us that we have 6 <code>ill</code> objects. There are two for each interface, one for IPv4 and one for IPv6. Let's take a closer look at the <code>mdb</code> call.</p>
+<pre class="z-code"><code><span class="z-text z-plain">         / Target the kernel for debugging
+</span><span class="z-text z-plain">        /
+</span><span class="z-text z-plain">       /  / Execute the following command
+</span><span class="z-text z-plain">      /  /
+</span><span class="z-text z-plain">     /  /
+</span><span class="z-text z-plain">mdb -k -e &quot;::walk ill | ::print ill_t ill_isv6 ill_name ill_token&quot;
+</span><span class="z-text z-plain">           \      \   \ \       \     \-------------------------/
+</span><span class="z-text z-plain">            \      \   \ \       \          members to print
+</span><span class="z-text z-plain">             \      \   \ \       \
+</span><span class="z-text z-plain">              \      \   \ \       \ interpret the address bing printed as an
+</span><span class="z-text z-plain">               \      \   \ \        ill_t kernel data structure
+</span><span class="z-text z-plain">                \      \   \ \ 
+</span><span class="z-text z-plain">                 \      \   \ \ print the data at the address piped in from the
+</span><span class="z-text z-plain">                  \      \   \  walk command
+</span><span class="z-text z-plain">                   \      \   \
+</span><span class="z-text z-plain">                    \      \   \ pipe the output of walk to the print command
+</span><span class="z-text z-plain">                     \      \
+</span><span class="z-text z-plain">                      \      \ select the ill walker
+</span><span class="z-text z-plain">                       \
+</span><span class="z-text z-plain">                        \ use the walk command to iterate over a list in the 
+</span><span class="z-text z-plain">                            kernel
+</span></code></pre>
+<p>There are several other walkers we can use to look at IP state in the kernel. Here are a few.</p>
+<pre class="z-code"><code><span class="z-text z-plain">mdb -k -e &quot;::walkers&quot; | egrep &quot;(^ip|^ill)&quot;
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">ill                      - walk active ill_t structures for all stacks
+</span><span class="z-text z-plain">illif                    - walk list of ill interface types for all stacks
+</span><span class="z-text z-plain">illif_stack              - walk list of ill interface types
+</span><span class="z-text z-plain">ip_conn_cache            - walk the ip_conn_cache cache
+</span><span class="z-text z-plain">ip_minor_arena_la_1      - walk the ip_minor_arena_la_1 cache
+</span><span class="z-text z-plain">ip_minor_arena_sa_1      - walk the ip_minor_arena_sa_1 cache
+</span><span class="z-text z-plain">ip_stacks                - walk all the ip_stack_t
+</span><span class="z-text z-plain">ipif                     - walk list of ipif structures for all stacks
+</span><span class="z-text z-plain">ipif_list                - walk the linked list of ipif structures for a given ill
+</span><span class="z-text z-plain">ipp_action               - walk the ipp_action cache
+</span><span class="z-text z-plain">ipp_mod                  - walk the ipp_mod cache
+</span><span class="z-text z-plain">ipp_packet               - walk the ipp_packet cache
+</span><span class="z-text z-plain">ipsec_actions            - walk the ipsec_actions cache
+</span><span class="z-text z-plain">ipsec_policy             - walk the ipsec_policy cache
+</span><span class="z-text z-plain">ipsec_selectors          - walk the ipsec_selectors cache
+</span><span class="z-text z-plain">iptun_cache              - walk the iptun_cache cache
+</span></code></pre>
+<p>Additionally there are a set of built in debugger commands that are also available for inspecting IP state in the kernel.</p>
+<pre class="z-code"><code><span class="z-text z-plain">mdb -k -e &quot;::dcmds&quot; | egrep &quot;(^ip|^ill)&quot;
+</span></code></pre>
+<pre class="z-code"><code><span class="z-text z-plain">ill                      - display ill_t structures
+</span><span class="z-text z-plain">illif                    - display or filter IP Lower Level InterFace structures
+</span><span class="z-text z-plain">ip6hdr                   - display an IPv6 header
+</span><span class="z-text z-plain">iphdr                    - display an IPv4 header
+</span><span class="z-text z-plain">ipif                     - display ipif structures
+</span></code></pre>
+<h3 id="ndp-interaction">NDP Interaction</h3>
+<p>In creating a link-local IPv6 address, NDP interactions occur in two places, which is readily seen in the DTrace call graph above. The first is when the address is being plumbed. Here, <code>ipadm_disable_autoconf</code> is called. This is done because at the time an IP address is being plumbed, it's not clear if any sort of NDP interaction will be needed. For example, if the interface is plumbed for a static IPv6 address, there is no need to kick off any NDP process. The decision on whether NDP should attempt to autoconfigure an IP interface is made in <code>i_ipadm_create_ipv6addrs</code>, if the <code>ipadm_stateless</code> or <code>ipadm_stateful</code> member is set to true then a message will be sent to <code>ndpd</code> to try to autoconfigure the address for the device. If we look back to the first bit of code along the IP address creation path we looked at <code>ipadm_create_addrobj</code> we see that for link-local addresses both <code>ipadm_stateless</code> and <code>ipadm_stateful</code> are set to true.</p>
+<p>If the <code>ipadm_stateless</code> member is true, <a href="https://www.rfc-editor.org/rfc/rfc4862">IPv6 stateless autoconfiguration</a> (SLAAC) will be performed. If the interface is connected to an IPv6 capable router delegating a prefix, an EUI-64 based IPv6 <a href="https://datatracker.ietf.org/doc/html/rfc4193">ULA</a> will be assigned to the interface. This address combines the prefix the router advertised and the same EUI-64 interface ID that was computed for the link-local address discussed earlier.</p>
+<p>If the <code>ipadm_stateful</code> member is true, a <a href="https://datatracker.ietf.org/doc/html/rfc8415">DHCPv6</a> client will be started. Stateless and stateful configurations are not mutually exclusive. They can be used side by side.</p>
+
+
+        </div>
+    </section>
+</body>
+
+<html>
