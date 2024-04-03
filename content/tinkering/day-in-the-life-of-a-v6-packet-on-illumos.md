@@ -554,7 +554,7 @@ CPU     ID                    FUNCTION:NAME
 
 Interesting, so now we have two code paths running through `ire_to_nce`. This
 was not actually what I was anticipating seeing (which is consistent with the
-circles I've been running around in for the past little bit) - bit it's
+circles I've been running around in for the past little bit) - but it's
 interesting so let's take a look!
 
 The first code path is identical to the case where the NCE for our destination
